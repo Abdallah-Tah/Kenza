@@ -1,0 +1,17 @@
+{
+    "client_id": "5c56098d-f146-40fe-823e-02893dfca4bb",
+    "account_mode": "SINGLE",
+    "redirect_uri": "msauth://com.example.kenza/auth",
+    "authorities": [
+        {
+            "type": "AAD",
+            "audience": {
+                "type": "AzureADMultipleOrgs",
+                "tenant_id": "organizations"
+            }
+        }
+    ],
+    "logging": {
+        "pii_enabled": false
+    }
+}
