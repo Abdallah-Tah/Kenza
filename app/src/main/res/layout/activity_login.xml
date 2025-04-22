@@ -7,7 +7,7 @@
     android:layout_height="match_parent"
     android:padding="16dp"
     android:background="@color/white"
-    tools:context="com.kenza.kenza.ui.activities.LoginActivity">
+    tools:context="com.example.kenza.LoginActivity">
 
     <ImageView
         android:id="@+id/imageViewLogo"
@@ -37,7 +37,7 @@
         android:id="@+id/textViewLoginSubtitle"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:text="Sign in with your Microsoft account"
+        android:text="Choose your email provider to get started"
         android:textSize="16sp"
         android:layout_marginTop="8dp"
         app:layout_constraintEnd_toEndOf="parent"
@@ -49,11 +49,13 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginHorizontal="32dp"
-        android:text="Sign in with Microsoft"
+        android:text="Choose Email Provider"
         android:textAllCaps="false"
         android:padding="12dp"
         android:layout_marginTop="48dp"
         app:cornerRadius="8dp"
+        app:icon="@drawable/ic_email"
+        app:iconGravity="start"
         app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintTop_toBottomOf="@+id/textViewLoginSubtitle" />

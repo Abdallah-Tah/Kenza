@@ -3,37 +3,71 @@ package com.example.kenza
 import android.content.Intent
 import android.os.Bundle
 import android.util.Log
+import android.view.LayoutInflater
 import android.widget.Button
 import android.widget.Toast
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
-import com.microsoft.identity.client.AcquireTokenParameters
-import com.microsoft.identity.client.AuthenticationCallback
-import com.microsoft.identity.client.IAccount
-import com.microsoft.identity.client.IPublicClientApplication
-import com.microsoft.identity.client.ISingleAccountPublicClientApplication
-import com.microsoft.identity.client.PublicClientApplication
+import com.microsoft.identity.client.*
 import com.microsoft.identity.client.exception.MsalException
-import java.util.Arrays
+import java.util.*
 
 class LoginActivity : AppCompatActivity() {
-
     private lateinit var loginButton: Button
     private val TAG = "LoginActivity"
-    private val scopes = Arrays.asList("User.Read", "Mail.ReadWrite", "offline_access")
+    private val microsoftScopes = Arrays.asList("User.Read", "Mail.ReadWrite", "offline_access")
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_login)
 
         loginButton = findViewById(R.id.buttonLogin)
-        loginButton.isEnabled = false // Disable until MSAL is initialized
+        loginButton.text = "Choose Email Provider"
+        loginButton.setOnClickListener {
+            showProviderSelectionDialog()
+        }
+    }
 
-        // Initialize MSAL
-        PublicClientApplication.createSingleAccountPublicClientApplication(this,
+    private fun showProviderSelectionDialog() {
+        val dialogView = LayoutInflater.from(this).inflate(R.layout.dialog_email_provider, null)
+        val dialog = AlertDialog.Builder(this)
+            .setView(dialogView)
+            .create()
+
+        // Microsoft login
+        dialogView.findViewById<Button>(R.id.buttonMicrosoft).setOnClickListener {
+            dialog.dismiss()
+            initiateMicrosoftLogin()
+        }
+
+        // Gmail login (to be implemented)
+        dialogView.findViewById<Button>(R.id.buttonGmail).setOnClickListener {
+            dialog.dismiss()
+            Toast.makeText(this, "Gmail login coming soon!", Toast.LENGTH_SHORT).show()
+        }
+
+        // Yahoo login (to be implemented)
+        dialogView.findViewById<Button>(R.id.buttonYahoo).setOnClickListener {
+            dialog.dismiss()
+            Toast.makeText(this, "Yahoo login coming soon!", Toast.LENGTH_SHORT).show()
+        }
+
+        // Custom email login (to be implemented)
+        dialogView.findViewById<Button>(R.id.buttonCustom).setOnClickListener {
+            dialog.dismiss()
+            Toast.makeText(this, "Custom email login coming soon!", Toast.LENGTH_SHORT).show()
+        }
+
+        dialog.show()
+    }
+
+    private fun initiateMicrosoftLogin() {
+        loginButton.isEnabled = false
+        PublicClientApplication.createSingleAccountPublicClientApplication(
+            this,
             R.raw.auth_config_single_account,
             object : IPublicClientApplication.ISingleAccountApplicationCreatedListener {
                 override fun onCreated(application: ISingleAccountPublicClientApplication) {
-                    // Store MSAL instance in MainApplication
                     (applicationContext as MainApplication).msalInstance = application
                     loadAccount()
                     loginButton.isEnabled = true
@@ -42,20 +76,9 @@ class LoginActivity : AppCompatActivity() {
                 override fun onError(exception: MsalException) {
                     Log.e(TAG, "MSAL Init Error: ${exception.message}")
                     Toast.makeText(this@LoginActivity, "MSAL Initialization Failed", Toast.LENGTH_SHORT).show()
+                    loginButton.isEnabled = true
                 }
             })
-
-        loginButton.setOnClickListener {
-            val app = (applicationContext as MainApplication).msalInstance
-            app?.let {
-                val parameters = AcquireTokenParameters.Builder()
-                    .startAuthorizationFromActivity(this)
-                    .withScopes(scopes)
-                    .withCallback(getAuthInteractiveCallback())
-                    .build()
-                it.acquireToken(parameters)
-            }
-        }
     }
 
     private fun loadAccount() {
@@ -68,6 +91,7 @@ class LoginActivity : AppCompatActivity() {
                 } else {
                     Log.d(TAG, "No active account found.")
                     loginButton.isEnabled = true
+                    initiateInteractiveLogin()
                 }
             }
 
@@ -84,11 +108,23 @@ class LoginActivity : AppCompatActivity() {
         })
     }
 
+    private fun initiateInteractiveLogin() {
+        val app = (applicationContext as MainApplication).msalInstance
+        app?.let {
+            val parameters = AcquireTokenParameters.Builder()
+                .startAuthorizationFromActivity(this)
+                .withScopes(microsoftScopes)
+                .withCallback(getAuthInteractiveCallback())
+                .build()
+            it.acquireToken(parameters)
+        }
+    }
+
     private fun getAuthInteractiveCallback(): AuthenticationCallback {
         return object : AuthenticationCallback {
-            override fun onSuccess(authenticationResult: IAuthenticationResult) {
+            override fun onSuccess(result: IAuthenticationResult) {
                 Log.d(TAG, "Successfully authenticated")
-                Log.d(TAG, "Account: ${authenticationResult.account.username}")
+                Log.d(TAG, "Account: ${result.account.username}")
                 navigateToDashboard()
             }
 

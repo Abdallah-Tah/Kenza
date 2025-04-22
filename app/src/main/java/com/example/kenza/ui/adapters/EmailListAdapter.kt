@@ -1,9 +1,9 @@
-package com.kenza.kenza.ui.adapters
+package com.example.kenza.ui.adapters
 
 import android.view.View
 import android.view.ViewGroup
 import androidx.recyclerview.widget.RecyclerView
-import com.kenza.kenza.database.models.CleanedEmail // Or a different Email model if needed
+import com.example.kenza.database.models.CleanedEmail
 
 class EmailListAdapter(private val emails: List<CleanedEmail>) : RecyclerView.Adapter<EmailListAdapter.EmailViewHolder>() {
 

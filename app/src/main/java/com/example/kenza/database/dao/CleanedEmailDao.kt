@@ -1,10 +1,10 @@
-package com.kenza.kenza.database
+package com.example.kenza.database.dao
 
 import androidx.room.Dao
 import androidx.room.Delete
 import androidx.room.Insert
 import androidx.room.Query
-import com.kenza.kenza.database.models.CleanedEmail
+import com.example.kenza.database.models.CleanedEmail
 import kotlinx.coroutines.flow.Flow
 
 @Dao
@@ -26,6 +26,4 @@ interface CleanedEmailDao {
 
     @Delete
     suspend fun delete(cleanedEmails: List<CleanedEmail>)
-
-    // TODO: Add other necessary queries (e.g., update action)
 }

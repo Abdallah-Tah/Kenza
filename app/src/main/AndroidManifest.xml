@@ -49,9 +49,9 @@
             </intent-filter>
         </activity>
 
-        <!-- Other activities -->
+        <!-- DashboardActivity -->
         <activity
-            android:name=".ui.activities.DashboardActivity"
+            android:name=".DashboardActivity"
             android:exported="false" />
 
     </application>

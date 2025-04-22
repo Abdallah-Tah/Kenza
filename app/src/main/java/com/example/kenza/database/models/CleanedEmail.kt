@@ -1,4 +1,4 @@
-package com.kenza.kenza.database.models
+package com.example.kenza.database.models
 
 import androidx.room.Entity
 import androidx.room.PrimaryKey
