@@ -4,6 +4,9 @@ plugins {
     id("org.jetbrains.kotlin.kapt")
 }
 
+// Read OpenAI API key from local.properties and expose as BuildConfig field
+val openAIApiKey: String? = project.findProperty("openai.api.key") as String?
+
 android {
     namespace = "com.example.kenza"
     compileSdk = 34
@@ -16,6 +19,10 @@ android {
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        if (openAIApiKey != null) {
+            buildConfigField("String", "OPENAI_API_KEY", "\"$openAIApiKey\"")
+        }
     }
 
     buildTypes {

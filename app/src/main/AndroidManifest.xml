@@ -42,10 +42,7 @@
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
-                <data
-                    android:scheme="msauth"
-                    android:host="com.example.kenza"
-                    android:path="/auth" />
+                <data android:scheme="msauth.com.example.kenza" android:host="auth" />
             </intent-filter>
         </activity>
 
