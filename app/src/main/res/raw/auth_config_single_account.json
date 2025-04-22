@@ -1,5 +1,5 @@
 {
-    "client_id": "e40fd084-b85c-4398-9b04-53a0b1d0415c",
+    "client_id": "539e390f-5dc4-4d22-907d-03c9ea7ac9e8",
     "account_mode": "SINGLE",
     "redirect_uri": "msauth.com.example.kenza://auth",
     "broker_redirect_uri_registered": true,

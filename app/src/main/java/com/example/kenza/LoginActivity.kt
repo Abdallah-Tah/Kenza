@@ -15,7 +15,9 @@ import java.util.*
 class LoginActivity : AppCompatActivity() {
     private lateinit var loginButton: Button
     private val TAG = "LoginActivity"
-    private val microsoftScopes = Arrays.asList("User.Read", "Mail.ReadWrite", "offline_access")
+    private val microsoftScopes = Arrays.asList(
+        "User.Read", "Mail.ReadWrite", "offline_access", "email", "openid", "profile"
+    )
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
