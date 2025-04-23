@@ -15,6 +15,12 @@ interface CleanedEmailDao {
     @Query("SELECT * FROM cleaned_emails ORDER BY actionTimestamp DESC")
     fun getAllCleanedEmails(): Flow<List<CleanedEmail>>
 
+    @Query("SELECT * FROM cleaned_emails ORDER BY actionTimestamp DESC")
+    fun getAllCleanedEmailsSync(): List<CleanedEmail>
+
+    @Query("SELECT * FROM cleaned_emails WHERE actionTaken = :action ORDER BY actionTimestamp DESC")
+    fun getEmailsByActionSync(action: String): List<CleanedEmail>
+
     @Query("SELECT * FROM cleaned_emails WHERE actionTaken = :action AND actionTimestamp < :timestamp")
     suspend fun getEmailsOlderThan(action: String, timestamp: Long): List<CleanedEmail>
 
@@ -26,4 +32,7 @@ interface CleanedEmailDao {
 
     @Delete
     suspend fun delete(cleanedEmails: List<CleanedEmail>)
+
+    @Query("DELETE FROM cleaned_emails WHERE actionTimestamp < :timestamp")
+    suspend fun deleteOlderThan(timestamp: Long): Int
 }

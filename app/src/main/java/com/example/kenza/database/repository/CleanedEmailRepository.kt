@@ -20,7 +20,7 @@ class CleanedEmailRepository(private val cleanedEmailDao: CleanedEmailDao) {
     }
 
     @WorkerThread
-    suspend fun delete(cleanedEmails: List<CleanedEmail>) {
+    suspend fun deleteMultiple(cleanedEmails: List<CleanedEmail>) {
         cleanedEmailDao.delete(cleanedEmails)
     }
 
@@ -30,9 +30,25 @@ class CleanedEmailRepository(private val cleanedEmailDao: CleanedEmailDao) {
     }
 
     @WorkerThread
-    suspend fun getEmailsToDelete(action: String = "moved_to_trash"): List<CleanedEmail> {
+    suspend fun getEmailsToDelete(action: String = "moved"): List<CleanedEmail> {
         val thirtyDaysInMillis = TimeUnit.DAYS.toMillis(30)
         val cutoffTimestamp = System.currentTimeMillis() - thirtyDaysInMillis
         return cleanedEmailDao.getEmailsOlderThan(action, cutoffTimestamp)
+    }
+    
+    @WorkerThread
+    fun getAllCleanedEmailsSync(): List<CleanedEmail> {
+        return cleanedEmailDao.getAllCleanedEmailsSync()
+    }
+    
+    @WorkerThread
+    fun getEmailsByActionSync(action: String): List<CleanedEmail> {
+        return cleanedEmailDao.getEmailsByActionSync(action)
+    }
+    
+    @WorkerThread
+    suspend fun purgeOldEmails(days: Int = 30): Int {
+        val cutoffTimestamp = System.currentTimeMillis() - TimeUnit.DAYS.toMillis(days.toLong())
+        return cleanedEmailDao.deleteOlderThan(cutoffTimestamp)
     }
 }

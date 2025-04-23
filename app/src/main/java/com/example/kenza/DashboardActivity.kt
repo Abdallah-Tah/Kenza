@@ -23,6 +23,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.io.IOException
 import java.util.Properties
+import java.util.concurrent.TimeUnit
 import javax.mail.Authenticator
 import javax.mail.Message
 import javax.mail.PasswordAuthentication
@@ -33,6 +34,13 @@ import javax.mail.internet.MimeMessage
 import com.example.kenza.database.models.CleanedEmail
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.content.Context
+import android.os.Build
 
 class DashboardActivity : AppCompatActivity() {
     private lateinit var buttonClean: Button
@@ -45,12 +53,16 @@ class DashboardActivity : AppCompatActivity() {
 
     companion object {
         private const val TAG = "DashboardActivity"
+        private const val NOTIFICATION_CHANNEL_ID = "kenza_cleaning_channel"
+        private const val CLEANUP_NOTIFICATION_ID = 1001
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_dashboard)
-
+        
+        createNotificationChannel()
+        
         buttonClean = findViewById(R.id.buttonClean)
         buttonViewBinRecovery = findViewById(R.id.buttonViewBinRecovery)
         buttonViewProfile = findViewById(R.id.buttonViewProfile)
@@ -89,11 +101,13 @@ class DashboardActivity : AppCompatActivity() {
         }
 
         buttonViewBinRecovery.setOnClickListener {
-            Toast.makeText(this, "View Bin Recovery not yet implemented.", Toast.LENGTH_SHORT).show()
+            startActivity(Intent(this, BinRecoveryActivity::class.java))
         }
+        
         buttonViewProfile.setOnClickListener {
             Toast.makeText(this, "View Profile not yet implemented.", Toast.LENGTH_SHORT).show()
         }
+        
         buttonSignOut.setOnClickListener {
             msalInstance?.signOut(object : ISingleAccountPublicClientApplication.SignOutCallback {
                 override fun onSignOut() {
@@ -107,19 +121,78 @@ class DashboardActivity : AppCompatActivity() {
                 }
             })
         }
+        
+        // Check for emails older than 30 days and schedule for deletion
+        checkAndPurgeOldEmails()
+    }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val name = "Email Cleaning Notifications"
+            val descriptionText = "Notifications about email cleaning activities"
+            val importance = NotificationManager.IMPORTANCE_DEFAULT
+            val channel = NotificationChannel(NOTIFICATION_CHANNEL_ID, name, importance).apply {
+                description = descriptionText
+            }
+            val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            notificationManager.createNotificationChannel(channel)
+        }
+    }
+    
+    private fun checkAndPurgeOldEmails() {
+        lifecycleScope.launch(Dispatchers.IO) {
+            val repository = (applicationContext as MainApplication).repository
+            val cutoffTimestamp = System.currentTimeMillis() - TimeUnit.DAYS.toMillis(30)
+            
+            // Find emails older than 30 days
+            val oldEmails = repository.getAllCleanedEmailsSync().filter { 
+                it.actionTimestamp < cutoffTimestamp 
+            }
+            
+            if (oldEmails.isNotEmpty()) {
+                // Delete old emails from database
+                repository.deleteMultiple(oldEmails)
+                
+                // Show notification
+                withContext(Dispatchers.Main) {
+                    showCleanupNotification(oldEmails.size)
+                }
+            }
+        }
+    }
+    
+    private fun showCleanupNotification(count: Int) {
+        val notification = NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setContentTitle("Email Cleanup")
+            .setContentText("$count emails have been permanently deleted after 30 days in the bin")
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .setAutoCancel(true)
+            .build()
+
+        with(NotificationManagerCompat.from(this)) {
+            try {
+                notify(CLEANUP_NOTIFICATION_ID, notification)
+            } catch (e: SecurityException) {
+                // Handle missing notification permission in Android 13+
+                Log.e(TAG, "Notification permission denied: ${e.message}")
+            }
+        }
     }
 
     private fun acquireTokenAndCleanEmails() {
+        buttonClean.isEnabled = false
+        
         val app = (applicationContext as MainApplication).msalInstance
         app?.getCurrentAccountAsync(object : ISingleAccountPublicClientApplication.CurrentAccountCallback {
             override fun onAccountLoaded(activeAccount: IAccount?) {
                 if (activeAccount == null) {
                     runOnUiThread {
                         Toast.makeText(this@DashboardActivity, "No active account. Please login again.", Toast.LENGTH_SHORT).show()
+                        buttonClean.isEnabled = true
                     }
                     return
                 }
-                // Updated scopes to match exactly what's in Azure
                 val scopes = arrayOf("User.Read", "Mail.ReadWrite")
                 val params = AcquireTokenSilentParameters.Builder()
                     .forAccount(activeAccount)
@@ -139,6 +212,7 @@ class DashboardActivity : AppCompatActivity() {
                             Log.e(TAG, "Cause: ${exception.cause}")
                             runOnUiThread {
                                 Toast.makeText(this@DashboardActivity, "Session expired. Please login again.", Toast.LENGTH_LONG).show()
+                                buttonClean.isEnabled = true
                             }
                         }
                     })
@@ -149,6 +223,7 @@ class DashboardActivity : AppCompatActivity() {
             override fun onError(exception: MsalException) {
                 runOnUiThread {
                     Toast.makeText(this@DashboardActivity, "Error getting account: ${exception.message}", Toast.LENGTH_SHORT).show()
+                    buttonClean.isEnabled = true
                 }
             }
         })
@@ -156,7 +231,7 @@ class DashboardActivity : AppCompatActivity() {
 
     private fun fetchRecentEmailsAndClassify(accessToken: String) {
         val graphUrl =
-            "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?\$top=10&\$select=id,subject,bodyPreview,from,receivedDateTime"
+            "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?\$top=25&\$select=id,subject,bodyPreview,from,receivedDateTime,sender"
         val client = OkHttpClient()
         val request = Request.Builder()
             .url(graphUrl)
@@ -167,46 +242,112 @@ class DashboardActivity : AppCompatActivity() {
             override fun onFailure(call: Call, e: IOException) {
                 runOnUiThread {
                     Toast.makeText(this@DashboardActivity, "Failed to fetch emails: ${e.message}", Toast.LENGTH_SHORT).show()
+                    buttonClean.isEnabled = true
                 }
             }
             override fun onResponse(call: Call, response: Response) {
                 if (!response.isSuccessful) {
                     runOnUiThread {
                         Toast.makeText(this@DashboardActivity, "Failed to fetch emails: ${response.code}", Toast.LENGTH_SHORT).show()
+                        buttonClean.isEnabled = true
                     }
                     return
                 }
                 val body = response.body?.string() ?: return
                 val json = JSONObject(body)
                 val messages = json.optJSONArray("value") ?: return
+                
+                var processedCount = 0
+                var cleanedCount = 0
+                
                 for (i in 0 until messages.length()) {
                     val msg = messages.getJSONObject(i)
+                    val messageId = msg.optString("id")
+                    val subject = msg.optString("subject")
+                    val bodyPreview = msg.optString("bodyPreview")
+                    val sender = msg.optJSONObject("sender")?.optJSONObject("emailAddress")?.optString("address") ?: "Unknown"
+                    val receivedDateTime = msg.optString("receivedDateTime")
+                    
                     classifyEmailWithOpenAI(
-                        msg.optString("subject"),
-                        msg.optString("bodyPreview"),
-                        msg.optString("id"),
-                        accessToken
+                        subject,
+                        bodyPreview,
+                        messageId,
+                        accessToken,
+                        sender,
+                        receivedDateTime,
+                        onComplete = { wasClassified ->
+                            processedCount++
+                            if (wasClassified) cleanedCount++
+                            
+                            // When all emails have been processed
+                            if (processedCount == messages.length()) {
+                                runOnUiThread {
+                                    buttonClean.isEnabled = true
+                                    if (cleanedCount > 0) {
+                                        showCleaningResultNotification(cleanedCount)
+                                    }
+                                    Toast.makeText(this@DashboardActivity, 
+                                        "Processed ${messages.length()} emails, cleaned $cleanedCount", 
+                                        Toast.LENGTH_LONG).show()
+                                }
+                            }
+                        }
                     )
-                }
-                runOnUiThread {
-                    Toast.makeText(this@DashboardActivity, "Fetched and classified ${messages.length()} emails.", Toast.LENGTH_SHORT).show()
                 }
             }
         })
+    }
+
+    private fun showCleaningResultNotification(cleanedCount: Int) {
+        val notification = NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setContentTitle("Email Cleaning Complete")
+            .setContentText("$cleanedCount emails were cleaned from your inbox")
+            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .setAutoCancel(true)
+            .build()
+
+        with(NotificationManagerCompat.from(this)) {
+            try {
+                notify(System.currentTimeMillis().toInt(), notification)
+            } catch (e: SecurityException) {
+                Log.e(TAG, "Notification permission denied: ${e.message}")
+            }
+        }
     }
 
     private fun classifyEmailWithOpenAI(
         subject: String,
         preview: String,
         messageId: String,
-        accessToken: String
+        accessToken: String,
+        sender: String,
+        receivedDateTime: String,
+        onComplete: (Boolean) -> Unit
     ) {
         val client = OkHttpClient()
-        val prompt =
-            "Classify this email as spam, promotion, newsletter, important, or other. Subject: $subject. Body: $preview. Respond with only one word."
+        val prompt = """
+            Analyze this email to determine if it's unwanted content. Categorize it as one of the following:
+            1. SPAM - unsolicited commercial messages, scams, or harmful content
+            2. PROMOTION - marketing emails, deals, advertising
+            3. NEWSLETTER - subscription-based bulk emails
+            4. IMPORTANT - personal or business emails that require attention
+            5. OTHER - any other legitimate email
+
+            Subject: $subject
+            
+            From: $sender
+            
+            Body: $preview
+            
+            Respond with ONLY ONE of these words: SPAM, PROMOTION, NEWSLETTER, IMPORTANT, OTHER
+        """.trimIndent()
+        
         val json = JSONObject().apply {
             put("model", "gpt-3.5-turbo")
             put("messages", listOf(mapOf("role" to "user", "content" to prompt)))
+            put("temperature", 0.3) // Lower temperature for more focused results
+            put("max_tokens", 10) // We only need a single word response
         }
         val mediaType = "application/json".toMediaType()
         val body = json.toString().toRequestBody(mediaType)
@@ -219,38 +360,52 @@ class DashboardActivity : AppCompatActivity() {
 
         client.newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
-                sendSmtpNotification("OpenAI API Failure", "Error: ${e.message}")
+                Log.e(TAG, "OpenAI API call failed: ${e.message}")
+                onComplete(false)
             }
+            
             override fun onResponse(call: Call, response: Response) {
-                if (!response.isSuccessful) return
-                val respJson = JSONObject(response.body?.string() ?: return)
-                val classification = respJson
-                    .optJSONArray("choices")
-                    ?.optJSONObject(0)
-                    ?.optJSONObject("message")
-                    ?.optString("content")
-                    ?.trim()
-                    ?.lowercase()
-                if (classification in listOf("spam", "promotion", "newsletter")) {
-                    moveEmailToAICleanedFolder(accessToken, messageId,
-                        onSuccess = {
-                            val cleaned = CleanedEmail(
-                                messageId = messageId,
-                                subject = subject,
-                                sender = null,
-                                receivedDate = System.currentTimeMillis(),
-                                actionTaken = "moved",
-                                actionTimestamp = System.currentTimeMillis(),
-                                originalFolder = "inbox"
+                if (!response.isSuccessful) {
+                    Log.e(TAG, "OpenAI API error: ${response.code}")
+                    onComplete(false)
+                    return
+                }
+                
+                try {
+                    val respJson = JSONObject(response.body?.string() ?: "{}")
+                    val classification = respJson
+                        .optJSONArray("choices")
+                        ?.optJSONObject(0)
+                        ?.optJSONObject("message")
+                        ?.optString("content")
+                        ?.trim()
+                        ?.uppercase() ?: "OTHER"
+                    
+                    Log.d(TAG, "Email classified as: $classification - Subject: $subject")
+                    
+                    when (classification) {
+                        "SPAM", "PROMOTION", "NEWSLETTER" -> {
+                            moveEmailToAICleanedFolder(
+                                accessToken, 
+                                messageId,
+                                classification.lowercase(),
+                                subject,
+                                sender,
+                                receivedDateTime,
+                                onSuccess = { 
+                                    onComplete(true)
+                                },
+                                onError = { e -> 
+                                    Log.e(TAG, "Error moving email: $e") 
+                                    onComplete(false)
+                                }
                             )
-                            val app = applicationContext as MainApplication
-                            CoroutineScope(Dispatchers.IO).launch { app.repository.insert(cleaned) }
-                            runOnUiThread {
-                                Toast.makeText(this@DashboardActivity, "Email moved: $subject", Toast.LENGTH_SHORT).show()
-                            }
-                        },
-                        onError = { e -> runOnUiThread { Toast.makeText(this@DashboardActivity, e, Toast.LENGTH_SHORT).show() } }
-                    )
+                        }
+                        else -> onComplete(false)
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error processing OpenAI response: ${e.message}")
+                    onComplete(false)
                 }
             }
         })
@@ -259,6 +414,10 @@ class DashboardActivity : AppCompatActivity() {
     private fun moveEmailToAICleanedFolder(
         accessToken: String,
         messageId: String,
+        classification: String,
+        subject: String,
+        sender: String,
+        receivedDateTime: String,
         onSuccess: () -> Unit,
         onError: (String) -> Unit
     ) {
@@ -278,7 +437,7 @@ class DashboardActivity : AppCompatActivity() {
                     .firstOrNull { it.optString("displayName") == "AI Cleaned" }
                     ?.optString("id")
                 if (folderId != null) {
-                    moveEmailToFolder(accessToken, messageId, folderId, onSuccess, onError)
+                    moveEmailToFolder(accessToken, messageId, folderId, classification, subject, sender, receivedDateTime, onSuccess, onError)
                 } else {
                     val createJson = JSONObject().put("displayName", "AI Cleaned")
                     val mediaType = "application/json".toMediaType()
@@ -295,7 +454,8 @@ class DashboardActivity : AppCompatActivity() {
                         override fun onResponse(call: Call, response: Response) {
                             if (!response.isSuccessful) return onError("Create folder failed: ${response.code}")
                             val newId = JSONObject(response.body?.string() ?: "").optString("id")
-                            if (newId.isNotEmpty()) moveEmailToFolder(accessToken, messageId, newId, onSuccess, onError)
+                            if (newId.isNotEmpty()) 
+                                moveEmailToFolder(accessToken, messageId, newId, classification, subject, sender, receivedDateTime, onSuccess, onError)
                             else onError("Folder creation returned empty ID")
                         }
                     })
@@ -308,6 +468,10 @@ class DashboardActivity : AppCompatActivity() {
         accessToken: String,
         messageId: String,
         folderId: String,
+        classification: String,
+        subject: String,
+        sender: String,
+        receivedDateTime: String,
         onSuccess: () -> Unit,
         onError: (String) -> Unit
     ) {
@@ -323,7 +487,25 @@ class DashboardActivity : AppCompatActivity() {
         ).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) = onError("Move failed: ${e.message}")
             override fun onResponse(call: Call, response: Response) {
-                if (response.isSuccessful) onSuccess() else onError("Move failed: ${response.code}")
+                if (response.isSuccessful) {
+                    // Store the cleaned email in the database
+                    val cleaned = CleanedEmail(
+                        messageId = messageId,
+                        subject = subject,
+                        sender = sender,
+                        receivedDate = System.currentTimeMillis(),
+                        actionTaken = "moved",
+                        actionTimestamp = System.currentTimeMillis(),
+                        originalFolder = "inbox"
+                    )
+                    val app = (call.request().tag() as? Context ?: applicationContext) as MainApplication
+                    CoroutineScope(Dispatchers.IO).launch { 
+                        app.repository.insert(cleaned)
+                    }
+                    onSuccess()
+                } else {
+                    onError("Move failed: ${response.code}")
+                }
             }
         })
     }
