@@ -113,7 +113,7 @@ class DashboardActivity : AppCompatActivity() {
                     }
                     return
                 }
-                val scopes = arrayOf("User.Read", "Mail.ReadWrite", "offline_access")
+                val scopes = arrayOf("User.Read", /*"Mail.ReadWrite",*/ "offline_access")
                 val params = AcquireTokenSilentParameters.Builder()
                     .forAccount(activeAccount)
                     .fromAuthority(activeAccount.authority)

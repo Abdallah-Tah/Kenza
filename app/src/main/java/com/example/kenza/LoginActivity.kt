@@ -15,9 +15,7 @@ import java.util.*
 class LoginActivity : AppCompatActivity() {
     private lateinit var loginButton: Button
     private val TAG = "LoginActivity"
-    private val microsoftScopes = Arrays.asList(
-        "User.Read", "Mail.ReadWrite", "offline_access", "email", "openid", "profile"
-    )
+    private val microsoftScopes = listOf("User.Read", "openid", "profile") // Removed offline_access and email for testing
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -133,7 +131,7 @@ class LoginActivity : AppCompatActivity() {
             try {
                 val parameters = AcquireTokenParameters.Builder()
                     .startAuthorizationFromActivity(this)
-                    .withScopes(microsoftScopes)
+                    .withScopes(microsoftScopes) // Ensure this uses the updated list
                     .withCallback(getAuthInteractiveCallback())
                     .build()
                 it.acquireToken(parameters)

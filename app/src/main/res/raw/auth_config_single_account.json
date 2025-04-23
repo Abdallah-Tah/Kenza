@@ -1,13 +1,13 @@
 {
-    "client_id": "539e390f-5dc4-4d22-907d-03c9ea7ac9e8",
+    "client_id": "43c6f2f0-6814-4855-a6e8-aac6c5e3aac9",
+    "authorization_user_agent": "DEFAULT",
+    "redirect_uri": "msauth://com.example.kenza/SoSikUg9xnXLPx1YhpV7XgJwXPs%3D",
     "account_mode": "SINGLE",
-    "redirect_uri": "msauth.com.example.kenza://auth",
-    "broker_redirect_uri_registered": true,
     "authorities": [
         {
             "type": "AAD",
             "audience": {
-                "type": "PersonalMicrosoftAccount"
+                "type": "AzureADandPersonalMicrosoftAccount"
             }
         }
     ],

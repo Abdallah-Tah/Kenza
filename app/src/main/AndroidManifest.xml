@@ -42,7 +42,10 @@
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
-                <data android:scheme="msauth.com.example.kenza" android:host="auth" />
+                <!-- Corrected data tag for MSAL redirect with the runtime hash -->
+                <data android:scheme="msauth"
+                    android:host="com.example.kenza"
+                    android:path="/SoSikUg9xnXLPx1YhpV7XgJwXPs=" />
             </intent-filter>
         </activity>
 
