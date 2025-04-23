@@ -68,8 +68,8 @@ dependencies {
     implementation("androidx.room:room-ktx:$roomVersion")
     kapt("androidx.room:room-compiler:$roomVersion")
 
-    // Microsoft Authentication Library (MSAL)
-    implementation("com.microsoft.identity.client:msal:5.1.0") {
+    // Microsoft Authentication Library (MSAL) - Updated to latest version
+    implementation("com.microsoft.identity.client:msal:5.10.0") {
         exclude(group = "com.microsoft.device.display", module = "display-mask")
         exclude(group = "org.slf4j", module = "slf4j-api")
     }

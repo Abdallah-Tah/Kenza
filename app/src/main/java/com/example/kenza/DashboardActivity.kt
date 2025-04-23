@@ -2,6 +2,7 @@ package com.example.kenza
 
 import android.content.Intent
 import android.os.Bundle
+import android.util.Log
 import android.widget.Button
 import android.widget.TextView
 import android.widget.Toast
@@ -13,6 +14,7 @@ import com.microsoft.identity.client.AcquireTokenSilentParameters
 import com.microsoft.identity.client.IAuthenticationResult
 import com.microsoft.identity.client.SilentAuthenticationCallback
 import com.microsoft.identity.client.exception.MsalException
+import com.microsoft.identity.client.exception.MsalUiRequiredException
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import okhttp3.*
@@ -40,6 +42,10 @@ class DashboardActivity : AppCompatActivity() {
     private lateinit var textViewCountClean: TextView
     private lateinit var textViewCountUnsub: TextView
     private lateinit var textViewEmail: TextView
+
+    companion object {
+        private const val TAG = "DashboardActivity"
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -113,17 +119,24 @@ class DashboardActivity : AppCompatActivity() {
                     }
                     return
                 }
-                val scopes = arrayOf("User.Read", /*"Mail.ReadWrite",*/ "offline_access")
+                // Updated scopes to match exactly what's in Azure
+                val scopes = arrayOf("User.Read", "Mail.ReadWrite")
                 val params = AcquireTokenSilentParameters.Builder()
                     .forAccount(activeAccount)
                     .fromAuthority(activeAccount.authority)
                     .withScopes(scopes.toList())
                     .withCallback(object : SilentAuthenticationCallback {
                         override fun onSuccess(authenticationResult: IAuthenticationResult) {
+                            Log.d(TAG, "Silent token acquisition successful.")
                             val accessToken = authenticationResult.accessToken
                             fetchRecentEmailsAndClassify(accessToken)
                         }
                         override fun onError(exception: MsalException) {
+                            Log.e(TAG, "Silent token acquisition failed: ${exception.message}", exception)
+                            Log.e(TAG, "Error Code: ${exception.errorCode}")
+                            Log.e(TAG, "Error Type: ${exception.javaClass.simpleName}")
+                            Log.e(TAG, "Is Interaction Required: ${exception is MsalUiRequiredException}")
+                            Log.e(TAG, "Cause: ${exception.cause}")
                             runOnUiThread {
                                 Toast.makeText(this@DashboardActivity, "Session expired. Please login again.", Toast.LENGTH_LONG).show()
                             }

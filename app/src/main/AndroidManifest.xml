@@ -33,26 +33,36 @@
             android:name=".LoginActivity"
             android:exported="false" />
 
-        <!-- MSAL BrowserTabActivity -->
-        <activity
-            android:name="com.microsoft.identity.client.BrowserTabActivity"
-            android:exported="true"
-            android:launchMode="singleTask">
-            <intent-filter>
-                <action android:name="android.intent.action.VIEW" />
-                <category android:name="android.intent.category.DEFAULT" />
-                <category android:name="android.intent.category.BROWSABLE" />
-                <!-- Corrected data tag for MSAL redirect with the runtime hash -->
-                <data android:scheme="msauth"
-                    android:host="com.example.kenza"
-                    android:path="/SoSikUg9xnXLPx1YhpV7XgJwXPs=" />
-            </intent-filter>
-        </activity>
-
         <!-- DashboardActivity -->
         <activity
             android:name=".DashboardActivity"
             android:exported="false" />
+
+        <!-- BrowserTabActivity for MSAL with both required intent filters -->
+        <activity
+            android:name="com.microsoft.identity.client.BrowserTabActivity"
+            android:configChanges="orientation|keyboardHidden|screenSize|smallestScreenSize|screenLayout"
+            android:exported="true"
+            android:launchMode="singleTask"
+            tools:replace="android:configChanges">
+            <!-- Specific redirect URI intent filter -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data
+                    android:scheme="msauth"
+                    android:host="com.example.kenza"
+                    android:path="/SoSikUg9xnXLPx1YhpV7XgJwXPs%3D" />
+            </intent-filter>
+            <!-- Generic MSAL intent filter -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="msauth" />
+            </intent-filter>
+        </activity>
 
     </application>
 
