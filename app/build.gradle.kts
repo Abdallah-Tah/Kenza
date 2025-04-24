@@ -4,8 +4,12 @@ plugins {
     id("org.jetbrains.kotlin.kapt")
 }
 
-// Read OpenAI API key from local.properties and expose as BuildConfig field
-val openAIApiKey: String? = project.findProperty("openai.api.key") as String?
+// Read OpenAI API key from local.properties or provide empty default
+val openAIApiKey = try {
+    project.findProperty("openai.api.key")?.toString() ?: ""
+} catch (e: Exception) {
+    ""
+}
 
 android {
     namespace = "com.example.kenza"
@@ -29,7 +33,7 @@ android {
 
     buildTypes {
         debug {
-            buildConfigField("String", "OPENAI_API_KEY", "\"${project.findProperty("openai.api.key") ?: ""}\"")
+            buildConfigField("String", "OPENAI_API_KEY", "\"$openAIApiKey\"")
         }
         release {
             isMinifyEnabled = false
@@ -37,15 +41,15 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            buildConfigField("String", "OPENAI_API_KEY", "\"${project.findProperty("openai.api.key") ?: ""}\"")
+            buildConfigField("String", "OPENAI_API_KEY", "\"$openAIApiKey\"")
         }
     }
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_1_8
-        targetCompatibility = JavaVersion.VERSION_1_8
+        sourceCompatibility = JavaVersion.VERSION_11
+        targetCompatibility = JavaVersion.VERSION_11
     }
     kotlinOptions {
-        jvmTarget = "1.8"
+        jvmTarget = "11"
     }
     buildFeatures {
         viewBinding = true
