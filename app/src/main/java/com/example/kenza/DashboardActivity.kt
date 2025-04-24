@@ -84,6 +84,9 @@ class DashboardActivity : AppCompatActivity() {
         private const val CLEANUP_NOTIFICATION_ID = 1001
     }
 
+    // Add a property to hold the rules for the current session
+    private var currentExclusionSenders: Set<String> = emptySet()
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_dashboard)
@@ -94,6 +97,7 @@ class DashboardActivity : AppCompatActivity() {
         buttonViewBinRecovery = findViewById(R.id.buttonViewBinRecovery)
         buttonViewProfile = findViewById(R.id.buttonViewProfile)
         buttonSignOut = findViewById(R.id.buttonSignOut)
+        val buttonSettings = findViewById<Button>(R.id.buttonSettings)
         textViewCountClean = findViewById(R.id.textViewCountClean)
         textViewCountUnsub = findViewById(R.id.textViewCountUnsub)
         textViewEmail = findViewById(R.id.textViewEmail)
@@ -137,6 +141,10 @@ class DashboardActivity : AppCompatActivity() {
         
         buttonViewProfile.setOnClickListener {
             Toast.makeText(this, "View Profile not yet implemented.", Toast.LENGTH_SHORT).show()
+        }
+        
+        buttonSettings.setOnClickListener {
+            startActivity(Intent(this, SettingsActivity::class.java))
         }
         
         buttonSignOut.setOnClickListener {
@@ -284,6 +292,9 @@ class DashboardActivity : AppCompatActivity() {
         val isFirstRun = preferencesManager.isFirstRun()
         val lastCleanTime = preferencesManager.getLastCleanTime()
         
+        currentExclusionSenders = preferencesManager.getExclusionSenders() // Load rules
+        Log.d(TAG, "Loaded exclusion rules: $currentExclusionSenders")
+        
         fetchAndProcessEmails(isFirstRun, lastCleanTime, maxEmails)
     }
 
@@ -385,6 +396,16 @@ class DashboardActivity : AppCompatActivity() {
         sender: String,
         receivedDateTime: String
     ): Boolean {
+        // --- Check Exclusion Rules ---
+        val senderLower = sender.lowercase()
+        // Check exact address or domain
+        if (currentExclusionSenders.contains(senderLower) ||
+            currentExclusionSenders.contains(senderLower.substringAfter('@'))) {
+            Log.d(TAG, "Skipping email $messageId from $sender due to exclusion rule.")
+            return false // Indicate not cleaned
+        }
+        // --- End Check ---
+
         val useOpenAI = !(!BuildConfig.DEBUG || System.currentTimeMillis() % 3 == 0L)
         val apiKey = BuildConfig.OPENAI_API_KEY ?: ""
         val canUseOpenAI = useOpenAI && apiKey.isNotEmpty() && apiKey != "YOUR_API_KEY_HERE"
@@ -495,8 +516,8 @@ class DashboardActivity : AppCompatActivity() {
                     if (classification in listOf("SPAM", "PROMOTION", "NEWSLETTER")) {
                         activityScope.launch(emailProcessingDispatcher) {
                            try {
-                                val moved = moveEmailToAICleanedFolder(
-                                    accessToken, messageId, classification.lowercase(),
+                                val moved = moveEmailToFolderAction(
+                                    accessToken, messageId, "AI Cleaned", classification.lowercase(),
                                     subject, sender, receivedDateTime
                                 )
                                 if (continuation.isActive) continuation.resume(moved)
@@ -543,55 +564,51 @@ class DashboardActivity : AppCompatActivity() {
             } -> "promotion"
             senderLower.contains("marketing") || senderLower.contains("newsletter") || 
             senderLower.contains("noreply") || senderLower.contains("no-reply") -> "newsletter"
+            bodyLower.contains("unsubscribe here") || subjectLower.contains("unsubscribe") -> "unsubscribe"
             else -> "important"
         }
 
         Log.d(TAG, "Fallback classification result for $messageId: $classification")
 
-        if (classification in listOf("spam", "newsletter", "promotion")) {
-            try {
-                return moveEmailToAICleanedFolder(
-                    accessToken, messageId, classification,
-                    subject, sender, receivedDateTime
-                )
-            } catch (e: Exception) {
-                 Log.e(TAG, "Error moving email $messageId during fallback: ${e.message}", e)
-                 return false
+        return when (classification) {
+            "spam", "promotion", "newsletter" -> {
+                moveEmailToFolderAction(accessToken, messageId, "AI Cleaned", "moved", subject, sender, receivedDateTime)
             }
-        } else {
-            return false
+            "unsubscribe" -> {
+                moveEmailToFolderAction(accessToken, messageId, "AI Unsubscribed", "unsubscribed", subject, sender, receivedDateTime)
+            }
+            else -> false // Not cleaned
         }
     }
 
-    private suspend fun moveEmailToAICleanedFolder(
+    private suspend fun moveEmailToFolderAction( // Renamed for clarity
         accessToken: String,
         messageId: String,
-        classification: String,
+        targetFolderName: String, // e.g., "AI Cleaned", "AI Unsubscribed"
+        actionTaken: String, // e.g., "moved", "unsubscribed"
         subject: String,
         sender: String,
         receivedDateTime: String
     ): Boolean {
         try {
-            var folderId = aiCleanedFolderIdCache
-            if (folderId == null) {
-                Log.d(TAG, "Cache miss for AI Cleaned folder ID. Finding or creating...")
-                folderId = findOrCreateFolder(accessToken, "AI Cleaned")
-                aiCleanedFolderIdCache = folderId
-                Log.d(TAG, "AI Cleaned folder ID cached: $folderId")
-            } else {
-                Log.d(TAG, "Using cached AI Cleaned folder ID: $folderId")
-            }
+            // Use a cache specific to the folder name if needed, or simplify if only one target
+            // For now, let's assume findOrCreate handles concurrency adequately with the previous fix
+            // val folderId = getCachedFolderId(targetFolderName) ?: findOrCreateFolder(accessToken, targetFolderName).also { cacheFolderId(targetFolderName, it) }
+
+            // Simplified: Find/Create folder every time (less efficient but handles multiple targets)
+            // Consider caching if performance becomes an issue with many target folders
+            val folderId = findOrCreateFolder(accessToken, targetFolderName)
 
             val (success, error) = GraphApiUtils.moveEmail(accessToken, messageId, folderId)
 
             if (success) {
-                Log.d(TAG, "Successfully moved $messageId ($classification) to AI Cleaned folder.")
+                Log.d(TAG, "Successfully performed '$actionTaken' on $messageId -> folder '$targetFolderName'.")
                 val cleaned = CleanedEmail(
                     messageId = messageId,
                     subject = subject,
                     sender = sender,
                     receivedDate = System.currentTimeMillis(),
-                    actionTaken = "moved",
+                    actionTaken = actionTaken, // Use the provided action
                     actionTimestamp = System.currentTimeMillis(),
                     originalFolder = "inbox"
                 )
@@ -600,11 +617,11 @@ class DashboardActivity : AppCompatActivity() {
                 }
                 return true
             } else {
-                Log.e(TAG, "Failed to move $messageId to AI Cleaned folder: $error")
+                Log.e(TAG, "Failed to perform '$actionTaken' on $messageId -> folder '$targetFolderName': $error")
                 return false
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Error during moveEmailToAICleanedFolder for $messageId: ${e.message}", e)
+            Log.e(TAG, "Error during '$actionTaken' action for $messageId -> folder '$targetFolderName': ${e.message}", e)
             return false
         }
     }

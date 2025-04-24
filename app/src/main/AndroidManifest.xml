@@ -44,6 +44,12 @@
             android:name=".BinRecoveryActivity"
             android:exported="false" />
 
+        <!-- SettingsActivity -->
+        <activity
+            android:name=".SettingsActivity"
+            android:exported="false"
+            android:label="Settings" />
+
         <!-- BrowserTabActivity for MSAL with both required intent filters -->
         <activity
             android:name="com.microsoft.identity.client.BrowserTabActivity"

@@ -2,13 +2,14 @@ package com.example.kenza
 
 import android.app.Application
 import android.util.Log
+import androidx.work.Configuration
+import androidx.work.WorkManager
 import com.example.kenza.database.AppDatabase
 import com.example.kenza.database.repository.CleanedEmailRepository
-import com.example.kenza.utils.PreferencesManager
 import com.microsoft.identity.client.*
 import com.microsoft.identity.client.IPublicClientApplication.ISingleAccountApplicationCreatedListener
 import com.microsoft.identity.client.exception.MsalException
-import com.example.kenza.utils.GraphApiUtils
+import com.example.kenza.utils.PreferencesManager
 
 class MainApplication : Application() {
     lateinit var preferencesManager: PreferencesManager
@@ -37,6 +38,15 @@ class MainApplication : Application() {
         // Initialize MSAL
         initializeMsal()
         
+        // Configure WorkManager for background tasks
+        val workManagerConfig = Configuration.Builder()
+            .setMinimumLoggingLevel(Log.INFO)
+            .build()
+        WorkManager.initialize(this, workManagerConfig)
+        
+        // Check for scheduled cleaning
+        checkAndRestoreScheduledCleaning()
+        
         Log.d(TAG, "Application initialized successfully")
     }
     
@@ -56,5 +66,22 @@ class MainApplication : Application() {
                 }
             }
         )
+    }
+    
+    private fun checkAndRestoreScheduledCleaning() {
+        try {
+            // If schedule was enabled before app restart, make sure it's still set up
+            if (preferencesManager.isScheduleEnabled()) {
+                val (hour, minute) = preferencesManager.getScheduleTime()
+                if (hour != -1 && minute != -1) {
+                    Log.d(TAG, "Restoring scheduled cleaning at $hour:$minute")
+                    
+                    // We'll recreate the worker in the SettingsActivity when the user visits it
+                    // or we could implement the scheduling here directly
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error restoring scheduled cleaning: ${e.message}", e)
+        }
     }
 }

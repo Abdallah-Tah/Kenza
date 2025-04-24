@@ -17,6 +17,10 @@ class PreferencesManager(context: Context) {
         private const val KEY_LAST_CLEAN_TIME = "last_clean_time"
         private const val KEY_MAX_EMAILS = "max_emails_to_process"
         private const val KEY_FIRST_RUN = "first_run_completed"
+        private const val KEY_SCHEDULE_ENABLED = "schedule_enabled"
+        private const val KEY_SCHEDULE_HOUR = "schedule_hour"
+        private const val KEY_SCHEDULE_MINUTE = "schedule_minute"
+        private const val KEY_EXCLUSION_SENDERS = "exclusion_senders"
         
         // Default values
         private const val DEFAULT_MAX_EMAILS = 200 // Increased from 100 to 200
@@ -65,5 +69,46 @@ class PreferencesManager(context: Context) {
      */
     fun setMaxEmailsToProcess(max: Int) {
         prefs.edit().putInt(KEY_MAX_EMAILS, max).apply()
+    }
+
+    fun setScheduleEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_SCHEDULE_ENABLED, enabled).apply()
+    }
+
+    fun isScheduleEnabled(): Boolean {
+        return prefs.getBoolean(KEY_SCHEDULE_ENABLED, false)
+    }
+
+    fun setScheduleTime(hour: Int, minute: Int) {
+        prefs.edit()
+            .putInt(KEY_SCHEDULE_HOUR, hour)
+            .putInt(KEY_SCHEDULE_MINUTE, minute)
+            .apply()
+    }
+
+    fun getScheduleTime(): Pair<Int, Int> {
+        val hour = prefs.getInt(KEY_SCHEDULE_HOUR, -1) // Default -1 indicates not set
+        val minute = prefs.getInt(KEY_SCHEDULE_MINUTE, -1)
+        return Pair(hour, minute)
+    }
+
+    fun saveExclusionSenders(senders: Set<String>) {
+        prefs.edit().putStringSet(KEY_EXCLUSION_SENDERS, senders).apply()
+    }
+
+    fun getExclusionSenders(): Set<String> {
+        return prefs.getStringSet(KEY_EXCLUSION_SENDERS, emptySet()) ?: emptySet()
+    }
+
+    fun addExclusionSender(sender: String) {
+        val current = getExclusionSenders().toMutableSet()
+        current.add(sender.lowercase().trim()) // Store lowercase for case-insensitive matching
+        saveExclusionSenders(current)
+    }
+
+    fun removeExclusionSender(sender: String) {
+        val current = getExclusionSenders().toMutableSet()
+        current.remove(sender.lowercase().trim())
+        saveExclusionSenders(current)
     }
 }

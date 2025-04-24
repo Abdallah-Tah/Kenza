@@ -85,4 +85,7 @@ dependencies {
     // JavaMail for SMTP email notifications
     implementation("com.sun.mail:android-mail:1.6.7")
     implementation("com.sun.mail:android-activation:1.6.7")
+
+    // WorkManager
+    implementation("androidx.work:work-runtime-ktx:2.9.0") // Use the latest version
 }
