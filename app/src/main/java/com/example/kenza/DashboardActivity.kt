@@ -302,8 +302,8 @@ class DashboardActivity : AppCompatActivity() {
             return
         }
         
-        // Calculate how many emails to fetch in this batch
-        val batchSize = minOf(DEFAULT_PAGE_SIZE, maxRemainingEmails - totalEmailsProcessed)
+        // Calculate how many emails to fetch in this batch - set to 50 for each batch
+        val batchSize = 50  // Keep batch size constant at 50 for stability
         
         // Build URL with proper pagination and filtering
         var graphUrl = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?" +
@@ -313,13 +313,18 @@ class DashboardActivity : AppCompatActivity() {
             filterQuery
             
         // Add skipToken for pagination if we have one
-        currentSkipToken?.let {
-            graphUrl += "&\$skiptoken=$it"
+        if (currentSkipToken != null && currentSkipToken!!.isNotEmpty()) {
+            Log.d(TAG, "Adding skip token to URL: $currentSkipToken")
+            graphUrl += "&\$skiptoken=${currentSkipToken!!}"
         }
         
         Log.d(TAG, "Fetching emails with URL: $graphUrl")
         
-        val client = OkHttpClient()
+        val client = OkHttpClient.Builder()
+            .connectTimeout(30, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
+            .build()
+            
         val request = Request.Builder()
             .url(graphUrl)
             .addHeader("Authorization", "Bearer $accessToken")
@@ -346,21 +351,35 @@ class DashboardActivity : AppCompatActivity() {
                 
                 try {
                     val body = response.body?.string() ?: return
-                    Log.d(TAG, "Response body (truncated): ${body.take(200)}...")
+                    Log.d(TAG, "Response body (truncated): ${body.take(500)}...")
                     
                     val json = JSONObject(body)
-                    val messages = json.optJSONArray("value") ?: return
+                    val messages = json.optJSONArray("value") ?: JSONArray()
                     
                     // Extract skip token for next batch pagination if available
                     currentSkipToken = null // Reset first
+                    
                     if (json.has("@odata.nextLink")) {
                         val nextLink = json.getString("@odata.nextLink")
                         Log.d(TAG, "Next link found: $nextLink")
+                        
                         val skipTokenIndex = nextLink.indexOf("skiptoken=")
                         if (skipTokenIndex >= 0) {
-                            currentSkipToken = nextLink.substring(skipTokenIndex + 10)
-                            Log.d(TAG, "Extracted skip token: $currentSkipToken")
+                            // Extract token correctly, making sure to get the whole token
+                            val afterSkipToken = nextLink.substring(skipTokenIndex + 10)
+                            // If there are other URL parameters after the skiptoken, only take what's before them
+                            val endIndex = if (afterSkipToken.contains("&")) {
+                                afterSkipToken.indexOf("&")
+                            } else {
+                                afterSkipToken.length
+                            }
+                            currentSkipToken = afterSkipToken.substring(0, endIndex)
+                            Log.d(TAG, "Successfully extracted skip token: $currentSkipToken")
+                        } else {
+                            Log.w(TAG, "Found @odata.nextLink but couldn't extract skiptoken")
                         }
+                    } else {
+                        Log.d(TAG, "No more pages available")
                     }
                     
                     val messageCount = messages.length()
@@ -377,7 +396,7 @@ class DashboardActivity : AppCompatActivity() {
                     if (messageCount == 0) {
                         Log.d(TAG, "No emails found in this batch")
                         if (currentSkipToken != null) {
-                            Log.d(TAG, "Moving to next batch with skip token")
+                            Log.d(TAG, "Moving to next batch with skip token despite no emails")
                             fetchEmailBatch(filterQuery, maxRemainingEmails)
                         } else {
                             Log.d(TAG, "No more batches, completing")
@@ -392,7 +411,14 @@ class DashboardActivity : AppCompatActivity() {
                         val messageId = msg.optString("id")
                         val subject = msg.optString("subject", "(No subject)")
                         val bodyPreview = msg.optString("bodyPreview", "")
-                        val sender = msg.optJSONObject("sender")?.optJSONObject("emailAddress")?.optString("address") ?: "Unknown"
+                        var sender = "Unknown"
+                        
+                        try {
+                            sender = msg.optJSONObject("sender")?.optJSONObject("emailAddress")?.optString("address") ?: "Unknown"
+                        } catch (e: Exception) {
+                            Log.w(TAG, "Error parsing sender for email: ${e.message}")
+                        }
+                        
                         val receivedDateTime = msg.optString("receivedDateTime", "")
                         
                         Log.d(TAG, "Processing email: $subject from $sender")
@@ -422,7 +448,8 @@ class DashboardActivity : AppCompatActivity() {
                                         Log.d(TAG, "Batch completed. Processed: $processedInBatch, Cleaned: $cleanedInBatch")
                                         
                                         // If we have more emails and haven't reached max, fetch next batch
-                                        if (currentSkipToken != null && totalEmailsProcessed < maxRemainingEmails) {
+                                        if ((currentSkipToken != null && currentSkipToken!!.isNotEmpty()) && 
+                                            totalEmailsProcessed < maxRemainingEmails) {
                                             Log.d(TAG, "Moving to next batch, current total: $totalEmailsProcessed, max: $maxRemainingEmails")
                                             fetchEmailBatch(filterQuery, maxRemainingEmails)
                                         } else {
@@ -436,6 +463,7 @@ class DashboardActivity : AppCompatActivity() {
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "Error processing email batch: ${e.message}", e)
+                    e.printStackTrace()
                     runOnUiThread {
                         Toast.makeText(this@DashboardActivity, "Error processing emails: ${e.message}", Toast.LENGTH_SHORT).show()
                         completeProcessing()
