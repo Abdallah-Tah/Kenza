@@ -484,7 +484,7 @@ class DashboardActivity : AppCompatActivity() {
             }
             
             val json = JSONObject().apply {
-                put("model", "gpt-3.5-turbo")
+                put("model", "gpt-4o-mini-2024-07-18")
                 put("messages", messagesArray)
                 put("temperature", 0.3) // Lower temperature for more focused results
                 put("max_tokens", 10) // We only need a single word response
