@@ -80,13 +80,24 @@ class LoginActivity : AppCompatActivity() {
             val redirectUri = "msauth://com.example.kenza/SoSikUg9xnXLPx1YhpV7XgJwXPs%3D"
             Log.d(TAG, "Using redirect URI: $redirectUri")
             
+            // Use the MainApplication's existing MSAL instance if available
+            val mainApp = applicationContext as MainApplication
+            val existingMsalInstance = mainApp.msalInstance
+            
+            if (existingMsalInstance != null) {
+                Log.d(TAG, "Using existing MSAL instance")
+                loadAccount()
+                return
+            }
+            
+            // Create a new MSAL instance if one doesn't exist
             PublicClientApplication.createSingleAccountPublicClientApplication(
                 this,
                 R.raw.auth_config_single_account,
                 object : IPublicClientApplication.ISingleAccountApplicationCreatedListener {
                     override fun onCreated(application: ISingleAccountPublicClientApplication) {
                         Log.d(TAG, "MSAL application created successfully")
-                        (applicationContext as MainApplication).msalInstance = application
+                        // We'll use the instance created and managed by MainApplication
                         loadAccount()
                     }
 

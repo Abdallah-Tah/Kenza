@@ -135,7 +135,7 @@ class BinRecoveryActivity : AppCompatActivity() {
     
     private fun loadCleanedEmails() {
         lifecycleScope.launch {
-            val repository = (applicationContext as MainApplication).repository
+            val repository = (applicationContext as MainApplication).repository as com.example.kenza.database.repository.CleanedEmailRepository
             repository.allCleanedEmails.collect { emails ->
                 val cleanedEmails = emails.filter { it.actionTaken == "moved" }
                 withContext(Dispatchers.Main) {
@@ -230,7 +230,7 @@ class BinRecoveryActivity : AppCompatActivity() {
                     if (response.isSuccessful) {
                         // Update the database to mark this email as restored
                         lifecycleScope.launch(Dispatchers.IO) {
-                            val repository = (applicationContext as MainApplication).repository
+                            val repository = (applicationContext as MainApplication).repository as com.example.kenza.database.repository.CleanedEmailRepository
                             repository.delete(email)
                             withContext(Dispatchers.Main) {
                                 Toast.makeText(this@BinRecoveryActivity, "Email restored successfully", Toast.LENGTH_SHORT).show()
@@ -246,7 +246,7 @@ class BinRecoveryActivity : AppCompatActivity() {
     
     private fun checkAndPurgeOldEmails() {
         lifecycleScope.launch(Dispatchers.IO) {
-            val repository = (applicationContext as MainApplication).repository
+            val repository = (applicationContext as MainApplication).repository as com.example.kenza.database.repository.CleanedEmailRepository
             val allEmails = repository.getAllCleanedEmailsSync()
             
             val currentTime = System.currentTimeMillis()
@@ -271,7 +271,7 @@ class BinRecoveryActivity : AppCompatActivity() {
     private fun emptyBin() {
         showLoading(true)
         lifecycleScope.launch(Dispatchers.IO) {
-            val repository = (applicationContext as MainApplication).repository
+            val repository = (applicationContext as MainApplication).repository as com.example.kenza.database.repository.CleanedEmailRepository
             val cleanedEmails = repository.getEmailsByActionSync("moved")
             repository.deleteMultiple(cleanedEmails)
             

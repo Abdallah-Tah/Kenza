@@ -46,6 +46,7 @@ import android.os.Build
 import android.view.View
 import java.text.SimpleDateFormat
 import java.util.*
+import com.example.kenza.utils.GraphApiUtils
 
 class DashboardActivity : AppCompatActivity() {
     private lateinit var buttonClean: Button
@@ -91,7 +92,7 @@ class DashboardActivity : AppCompatActivity() {
 
         val app = applicationContext as MainApplication
         val msalInstance = app.msalInstance
-        val repository = app.repository
+        val repository = app.repository as com.example.kenza.database.repository.CleanedEmailRepository
 
         msalInstance?.getCurrentAccountAsync(object : ISingleAccountPublicClientApplication.CurrentAccountCallback {
             override fun onAccountLoaded(activeAccount: IAccount?) {
@@ -160,7 +161,7 @@ class DashboardActivity : AppCompatActivity() {
     
     private fun checkAndPurgeOldEmails() {
         lifecycleScope.launch(Dispatchers.IO) {
-            val repository = (applicationContext as MainApplication).repository
+            val repository = (applicationContext as MainApplication).repository as com.example.kenza.database.repository.CleanedEmailRepository
             val cutoffTimestamp = System.currentTimeMillis() - TimeUnit.DAYS.toMillis(30)
             
             // Find emails older than 30 days
@@ -293,184 +294,86 @@ class DashboardActivity : AppCompatActivity() {
         }
         
         updateProcessingStatus("Fetching emails...")
-        fetchEmailBatch(filterQuery, maxEmails)
-    }
-
-    private fun fetchEmailBatch(filterQuery: String, maxRemainingEmails: Int) {
-        if (totalEmailsProcessed >= maxRemainingEmails) {
-            completeProcessing()
-            return
-        }
         
-        // Calculate how many emails to fetch in this batch - set to 50 for each batch
-        val batchSize = 50  // Keep batch size constant at 50 for stability
+        // Reset counters
+        totalEmailsProcessed = 0
+        totalEmailsFound = 0
+        totalEmailsCleaned = 0
         
-        // Build URL with proper pagination and filtering
-        var graphUrl = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?" +
-            "\$top=$batchSize" +
-            "&\$select=id,subject,bodyPreview,from,receivedDateTime,sender" +
-            "&\$orderby=receivedDateTime desc" +
-            filterQuery
-            
-        // Add skipToken for pagination if we have one
-        if (currentSkipToken != null && currentSkipToken!!.isNotEmpty()) {
-            Log.d(TAG, "Adding skip token to URL: $currentSkipToken")
-            graphUrl += "&\$skiptoken=${currentSkipToken!!}"
-        }
-        
-        Log.d(TAG, "Fetching emails with URL: $graphUrl")
-        
-        val client = OkHttpClient.Builder()
-            .connectTimeout(30, TimeUnit.SECONDS)
-            .readTimeout(30, TimeUnit.SECONDS)
-            .build()
-            
-        val request = Request.Builder()
-            .url(graphUrl)
-            .addHeader("Authorization", "Bearer $accessToken")
-            .build()
-
-        client.newCall(request).enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) {
-                Log.e(TAG, "Failed to fetch emails: ${e.message}", e)
+        // Use the new GraphApiUtils for pagination
+        GraphApiUtils.fetchGraphEmailPages(
+            accessToken = accessToken ?: "",
+            baseUrl = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages",
+            filterQuery = filterQuery,
+            batchSize = 50,  // Microsoft API limit is 50
+            maxEmails = maxEmails,
+            initialSkipToken = null,
+            onBatch = { messages ->
+                val messageCount = messages.length()
+                Log.d(TAG, "Processing batch of $messageCount emails")
+                totalEmailsFound += messageCount
+                updateProcessingStatus("Processing batch of $messageCount emails...")
+                
+                // Initialize counters for this batch
+                var processedInBatch = 0
+                var cleanedInBatch = 0
+                
+                // Process each email in this batch
+                for (i in 0 until messageCount) {
+                    val msg = messages.getJSONObject(i)
+                    val messageId = msg.optString("id")
+                    val subject = msg.optString("subject", "(No subject)")
+                    val bodyPreview = msg.optString("bodyPreview", "")
+                    var sender = "Unknown"
+                    
+                    try {
+                        sender = msg.optJSONObject("sender")?.optJSONObject("emailAddress")?.optString("address") ?: "Unknown"
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Error parsing sender for email: ${e.message}")
+                    }
+                    
+                    val receivedDateTime = msg.optString("receivedDateTime", "")
+                    
+                    Log.d(TAG, "Processing email: $subject from $sender")
+                    
+                    // Classify and process this email
+                    classifyEmailWithOpenAI(
+                        subject,
+                        bodyPreview,
+                        messageId,
+                        accessToken ?: "",
+                        sender,
+                        receivedDateTime,
+                        onComplete = { wasClassified ->
+                            processedInBatch++
+                            if (wasClassified) cleanedInBatch++
+                            
+                            totalEmailsProcessed++
+                            totalEmailsCleaned += if (wasClassified) 1 else 0
+                            
+                            Log.d(TAG, "Email processed: $subject, wasClassified=$wasClassified, " +
+                                     "totalProcessed=$totalEmailsProcessed, totalCleaned=$totalEmailsCleaned")
+                            
+                            updateProcessingStatus("Processed: $totalEmailsProcessed\nCleaned: $totalEmailsCleaned")
+                        }
+                    )
+                }
+            },
+            onProgress = { processed, total ->
+                Log.d(TAG, "Pagination progress: $processed/$total")
+            },
+            onComplete = {
+                Log.d(TAG, "Email pagination complete. Total processed: $totalEmailsProcessed")
+                completeProcessing()
+            },
+            onError = { error ->
+                Log.e(TAG, "Error in email pagination: $error")
                 runOnUiThread {
-                    Toast.makeText(this@DashboardActivity, "Failed to fetch emails: ${e.message}", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this, "Error fetching emails: $error", Toast.LENGTH_SHORT).show()
                     completeProcessing()
                 }
             }
-            
-            override fun onResponse(call: Call, response: Response) {
-                if (!response.isSuccessful) {
-                    Log.e(TAG, "Failed to fetch emails: ${response.code}")
-                    runOnUiThread {
-                        Toast.makeText(this@DashboardActivity, "Failed to fetch emails: ${response.code}", Toast.LENGTH_SHORT).show()
-                        completeProcessing()
-                    }
-                    return
-                }
-                
-                try {
-                    val body = response.body?.string() ?: return
-                    Log.d(TAG, "Response body (truncated): ${body.take(500)}...")
-                    
-                    val json = JSONObject(body)
-                    val messages = json.optJSONArray("value") ?: JSONArray()
-                    
-                    // Extract skip token for next batch pagination if available
-                    currentSkipToken = null // Reset first
-                    
-                    if (json.has("@odata.nextLink")) {
-                        val nextLink = json.getString("@odata.nextLink")
-                        Log.d(TAG, "Next link found: $nextLink")
-                        
-                        val skipTokenIndex = nextLink.indexOf("skiptoken=")
-                        if (skipTokenIndex >= 0) {
-                            // Extract token correctly, making sure to get the whole token
-                            val afterSkipToken = nextLink.substring(skipTokenIndex + 10)
-                            // If there are other URL parameters after the skiptoken, only take what's before them
-                            val endIndex = if (afterSkipToken.contains("&")) {
-                                afterSkipToken.indexOf("&")
-                            } else {
-                                afterSkipToken.length
-                            }
-                            currentSkipToken = afterSkipToken.substring(0, endIndex)
-                            Log.d(TAG, "Successfully extracted skip token: $currentSkipToken")
-                        } else {
-                            Log.w(TAG, "Found @odata.nextLink but couldn't extract skiptoken")
-                        }
-                    } else {
-                        Log.d(TAG, "No more pages available")
-                    }
-                    
-                    val messageCount = messages.length()
-                    Log.d(TAG, "Fetched $messageCount emails")
-                    
-                    // Update the total count
-                    totalEmailsFound += messageCount
-                    updateProcessingStatus("Processing $messageCount emails...")
-                    
-                    var processedInBatch = 0
-                    var cleanedInBatch = 0
-                    
-                    // If no emails in this batch, either complete or fetch next batch
-                    if (messageCount == 0) {
-                        Log.d(TAG, "No emails found in this batch")
-                        if (currentSkipToken != null) {
-                            Log.d(TAG, "Moving to next batch with skip token despite no emails")
-                            fetchEmailBatch(filterQuery, maxRemainingEmails)
-                        } else {
-                            Log.d(TAG, "No more batches, completing")
-                            completeProcessing()
-                        }
-                        return
-                    }
-                    
-                    // Process each email in the current batch
-                    for (i in 0 until messageCount) {
-                        val msg = messages.getJSONObject(i)
-                        val messageId = msg.optString("id")
-                        val subject = msg.optString("subject", "(No subject)")
-                        val bodyPreview = msg.optString("bodyPreview", "")
-                        var sender = "Unknown"
-                        
-                        try {
-                            sender = msg.optJSONObject("sender")?.optJSONObject("emailAddress")?.optString("address") ?: "Unknown"
-                        } catch (e: Exception) {
-                            Log.w(TAG, "Error parsing sender for email: ${e.message}")
-                        }
-                        
-                        val receivedDateTime = msg.optString("receivedDateTime", "")
-                        
-                        Log.d(TAG, "Processing email: $subject from $sender")
-                        
-                        classifyEmailWithOpenAI(
-                            subject,
-                            bodyPreview,
-                            messageId,
-                            accessToken ?: "",
-                            sender,
-                            receivedDateTime,
-                            onComplete = { wasClassified ->
-                                processedInBatch++
-                                if (wasClassified) cleanedInBatch++
-                                
-                                totalEmailsProcessed++
-                                totalEmailsCleaned += if (wasClassified) 1 else 0
-                                
-                                Log.d(TAG, "Email processed: $subject, wasClassified=$wasClassified, " +
-                                         "totalProcessed=$totalEmailsProcessed, totalCleaned=$totalEmailsCleaned")
-                                
-                                updateProcessingStatus("Processed: $totalEmailsProcessed\nCleaned: $totalEmailsCleaned")
-                                
-                                // When all emails in this batch have been processed
-                                synchronized(this@DashboardActivity) {
-                                    if (processedInBatch == messageCount) {
-                                        Log.d(TAG, "Batch completed. Processed: $processedInBatch, Cleaned: $cleanedInBatch")
-                                        
-                                        // If we have more emails and haven't reached max, fetch next batch
-                                        if ((currentSkipToken != null && currentSkipToken!!.isNotEmpty()) && 
-                                            totalEmailsProcessed < maxRemainingEmails) {
-                                            Log.d(TAG, "Moving to next batch, current total: $totalEmailsProcessed, max: $maxRemainingEmails")
-                                            fetchEmailBatch(filterQuery, maxRemainingEmails)
-                                        } else {
-                                            Log.d(TAG, "All batches completed, finishing")
-                                            completeProcessing()
-                                        }
-                                    }
-                                }
-                            }
-                        )
-                    }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error processing email batch: ${e.message}", e)
-                    e.printStackTrace()
-                    runOnUiThread {
-                        Toast.makeText(this@DashboardActivity, "Error processing emails: ${e.message}", Toast.LENGTH_SHORT).show()
-                        completeProcessing()
-                    }
-                }
-            }
-        })
+        )
     }
 
     private fun completeProcessing() {
@@ -771,9 +674,11 @@ class DashboardActivity : AppCompatActivity() {
                 if (folderId != null) {
                     moveEmailToFolder(accessToken, messageId, folderId, classification, subject, sender, receivedDateTime, onSuccess, onError)
                 } else {
-                    val createJson = JSONObject().put("displayName", "AI Cleaned")
                     val mediaType = "application/json".toMediaType()
+                    val createJson = JSONObject()
+                    createJson.put("displayName", "AI Cleaned")
                     val body = createJson.toString().toRequestBody(mediaType)
+                    
                     client.newCall(
                         Request.Builder()
                             .url("https://graph.microsoft.com/v1.0/me/mailFolders")
@@ -808,7 +713,10 @@ class DashboardActivity : AppCompatActivity() {
         onError: (String) -> Unit
     ) {
         val mediaType = "application/json".toMediaType()
-        val body = JSONObject().put("destinationId", folderId).toString().toRequestBody(mediaType)
+        val jsonBody = JSONObject()
+        jsonBody.put("destinationId", folderId)
+        val body = jsonBody.toString().toRequestBody(mediaType)
+        
         OkHttpClient().newCall(
             Request.Builder()
                 .url("https://graph.microsoft.com/v1.0/me/messages/$messageId/move")
@@ -830,9 +738,8 @@ class DashboardActivity : AppCompatActivity() {
                         actionTimestamp = System.currentTimeMillis(),
                         originalFolder = "inbox"
                     )
-                    val app = (call.request().tag() as? Context ?: applicationContext) as MainApplication
-                    CoroutineScope(Dispatchers.IO).launch { 
-                        app.repository.insert(cleaned)
+                    CoroutineScope(Dispatchers.IO).launch {
+                        (applicationContext as MainApplication).repository.insert(cleaned)
                     }
                     onSuccess()
                 } else {
