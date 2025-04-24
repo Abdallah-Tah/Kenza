@@ -6,6 +6,7 @@ import android.util.Log
 import android.widget.Button
 import android.widget.TextView
 import android.widget.Toast
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
 import com.microsoft.identity.client.ISingleAccountPublicClientApplication
@@ -114,7 +115,8 @@ class DashboardActivity : AppCompatActivity() {
         }
 
         buttonClean.setOnClickListener {
-            acquireTokenAndCleanEmails()
+            // Show cleaning options dialog
+            showCleaningOptionsDialog()
         }
 
         buttonViewBinRecovery.setOnClickListener {
@@ -838,5 +840,77 @@ class DashboardActivity : AppCompatActivity() {
                 }
             }
         }.start()
+    }
+
+    /**
+     * Show a dialog to let the user choose cleaning options
+     */
+    private fun showCleaningOptionsDialog() {
+        val options = arrayOf(
+            "Smart Clean (Only New Emails)",
+            "Full Clean (All Emails)",
+            "Set Email Limit"
+        )
+        
+        AlertDialog.Builder(this)
+            .setTitle("Cleaning Options")
+            .setItems(options) { _, which ->
+                when (which) {
+                    0 -> {
+                        // Smart clean - use existing last clean timestamp
+                        acquireTokenAndCleanEmails()
+                    }
+                    1 -> {
+                        // Full clean - reset the last clean time and process all emails
+                        val app = applicationContext as MainApplication
+                        app.preferencesManager.saveLastCleanTime(0) // Reset to epoch time
+                        acquireTokenAndCleanEmails()
+                    }
+                    2 -> {
+                        // Set email limit
+                        showSetEmailLimitDialog()
+                    }
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+    
+    /**
+     * Show a dialog to let the user set the maximum number of emails to process
+     */
+    private fun showSetEmailLimitDialog() {
+        val app = applicationContext as MainApplication
+        val currentLimit = app.preferencesManager.getMaxEmailsToProcess()
+        
+        val options = arrayOf("25", "50", "100", "200", "500", "1000")
+        val selectedIndex = when (currentLimit) {
+            25 -> 0
+            50 -> 1
+            100 -> 2
+            200 -> 3
+            500 -> 4
+            1000 -> 5
+            else -> 2 // Default to 100
+        }
+        
+        AlertDialog.Builder(this)
+            .setTitle("Maximum Emails to Process")
+            .setSingleChoiceItems(options, selectedIndex) { dialog, which ->
+                val newLimit = when (which) {
+                    0 -> 25
+                    1 -> 50
+                    2 -> 100
+                    3 -> 200
+                    4 -> 500
+                    5 -> 1000
+                    else -> 100
+                }
+                app.preferencesManager.setMaxEmailsToProcess(newLimit)
+                Toast.makeText(this, "Email limit set to $newLimit", Toast.LENGTH_SHORT).show()
+                dialog.dismiss()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 }
