@@ -36,7 +36,14 @@ import javax.mail.internet.MimeMessage
 import com.example.kenza.database.models.CleanedEmail
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import android.app.NotificationChannel
@@ -47,6 +54,8 @@ import android.view.View
 import java.text.SimpleDateFormat
 import java.util.*
 import com.example.kenza.utils.GraphApiUtils
+import kotlinx.coroutines.delay
+
 
 class DashboardActivity : AppCompatActivity() {
     private lateinit var buttonClean: Button
@@ -64,13 +73,15 @@ class DashboardActivity : AppCompatActivity() {
     private var totalEmailsFound = 0
     private var totalEmailsCleaned = 0
     private var accessToken: String? = null
-    private var currentSkipToken: String? = null
+    private var aiCleanedFolderIdCache: String? = null // Cache for the folder ID
+
+    private val activityScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+    private val emailProcessingDispatcher = Dispatchers.IO.limitedParallelism(5)
 
     companion object {
         private const val TAG = "DashboardActivity"
         private const val NOTIFICATION_CHANNEL_ID = "kenza_cleaning_channel"
         private const val CLEANUP_NOTIFICATION_ID = 1001
-        private const val DEFAULT_PAGE_SIZE = 50 // Number of emails to fetch per batch
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -146,6 +157,11 @@ class DashboardActivity : AppCompatActivity() {
         checkAndPurgeOldEmails()
     }
 
+    override fun onDestroy() {
+        super.onDestroy()
+        activityScope.cancel()
+    }
+
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val name = "Email Cleaning Notifications"
@@ -210,8 +226,8 @@ class DashboardActivity : AppCompatActivity() {
         totalEmailsProcessed = 0
         totalEmailsFound = 0
         totalEmailsCleaned = 0
-        currentSkipToken = null
         isProcessingEmails = true
+        aiCleanedFolderIdCache = null // Reset cache before starting
         
         updateProcessingStatus("Authenticating...")
         buttonClean.isEnabled = false
@@ -224,9 +240,7 @@ class DashboardActivity : AppCompatActivity() {
                 if (activeAccount == null) {
                     runOnUiThread {
                         Toast.makeText(this@DashboardActivity, "No active account. Please login again.", Toast.LENGTH_SHORT).show()
-                        buttonClean.isEnabled = true
-                        isProcessingEmails = false
-                        updateProcessingStatus(null)
+                        completeProcessing(false)
                     }
                     return
                 }
@@ -243,15 +257,9 @@ class DashboardActivity : AppCompatActivity() {
                         }
                         override fun onError(exception: MsalException) {
                             Log.e(TAG, "Silent token acquisition failed: ${exception.message}", exception)
-                            Log.e(TAG, "Error Code: ${exception.errorCode}")
-                            Log.e(TAG, "Error Type: ${exception.javaClass.simpleName}")
-                            Log.e(TAG, "Is Interaction Required: ${exception is MsalUiRequiredException}")
-                            Log.e(TAG, "Cause: ${exception.cause}")
                             runOnUiThread {
                                 Toast.makeText(this@DashboardActivity, "Session expired. Please login again.", Toast.LENGTH_LONG).show()
-                                buttonClean.isEnabled = true
-                                isProcessingEmails = false
-                                updateProcessingStatus(null)
+                                completeProcessing(false)
                             }
                         }
                     })
@@ -262,9 +270,7 @@ class DashboardActivity : AppCompatActivity() {
             override fun onError(exception: MsalException) {
                 runOnUiThread {
                     Toast.makeText(this@DashboardActivity, "Error getting account: ${exception.message}", Toast.LENGTH_SHORT).show()
-                    buttonClean.isEnabled = true
-                    isProcessingEmails = false
-                    updateProcessingStatus(null)
+                    completeProcessing(false)
                 }
             }
         })
@@ -283,10 +289,8 @@ class DashboardActivity : AppCompatActivity() {
 
     private fun fetchAndProcessEmails(isFirstRun: Boolean, lastCleanTime: Long, maxEmails: Int) {
         val filterQuery = if (isFirstRun) {
-            // First run - no date filter, just fetch newest emails first
             ""
         } else {
-            // Convert timestamp to ISO 8601 format for Microsoft Graph API
             val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US)
             dateFormat.timeZone = TimeZone.getTimeZone("UTC")
             val dateString = dateFormat.format(Date(lastCleanTime))
@@ -295,106 +299,410 @@ class DashboardActivity : AppCompatActivity() {
         
         updateProcessingStatus("Fetching emails...")
         
-        // Reset counters
         totalEmailsProcessed = 0
         totalEmailsFound = 0
         totalEmailsCleaned = 0
-        
-        // Use the new GraphApiUtils for pagination
+
         GraphApiUtils.fetchGraphEmailPages(
             accessToken = accessToken ?: "",
             baseUrl = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages",
             filterQuery = filterQuery,
-            batchSize = 50,  // Microsoft API limit is 50
+            batchSize = 50,
             maxEmails = maxEmails,
             initialSkipToken = null,
             onBatch = { messages ->
                 val messageCount = messages.length()
-                Log.d(TAG, "Processing batch of $messageCount emails")
+                Log.d(TAG, "Received batch of $messageCount emails")
                 totalEmailsFound += messageCount
-                updateProcessingStatus("Processing batch of $messageCount emails...")
-                
-                // Initialize counters for this batch
-                var processedInBatch = 0
-                var cleanedInBatch = 0
-                
-                // Process each email in this batch
-                for (i in 0 until messageCount) {
-                    val msg = messages.getJSONObject(i)
-                    val messageId = msg.optString("id")
-                    val subject = msg.optString("subject", "(No subject)")
-                    val bodyPreview = msg.optString("bodyPreview", "")
-                    var sender = "Unknown"
-                    
-                    try {
-                        sender = msg.optJSONObject("sender")?.optJSONObject("emailAddress")?.optString("address") ?: "Unknown"
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Error parsing sender for email: ${e.message}")
-                    }
-                    
-                    val receivedDateTime = msg.optString("receivedDateTime", "")
-                    
-                    Log.d(TAG, "Processing email: $subject from $sender")
-                    
-                    // Classify and process this email
-                    classifyEmailWithOpenAI(
-                        subject,
-                        bodyPreview,
-                        messageId,
-                        accessToken ?: "",
-                        sender,
-                        receivedDateTime,
-                        onComplete = { wasClassified ->
-                            processedInBatch++
-                            if (wasClassified) cleanedInBatch++
-                            
-                            totalEmailsProcessed++
-                            totalEmailsCleaned += if (wasClassified) 1 else 0
-                            
-                            Log.d(TAG, "Email processed: $subject, wasClassified=$wasClassified, " +
-                                     "totalProcessed=$totalEmailsProcessed, totalCleaned=$totalEmailsCleaned")
-                            
-                            updateProcessingStatus("Processed: $totalEmailsProcessed\nCleaned: $totalEmailsCleaned")
+                updateProcessingStatus("Processing batch ($totalEmailsFound found)...")
+
+                activityScope.launch {
+                    val processingJobs = (0 until messageCount).map { i ->
+                        async(emailProcessingDispatcher) {
+                            val msg = messages.getJSONObject(i)
+                            val messageId = msg.optString("id")
+                            val subject = msg.optString("subject", "(No subject)")
+                            val bodyPreview = msg.optString("bodyPreview", "")
+                            var sender = "Unknown"
+                            try {
+                                sender = msg.optJSONObject("sender")?.optJSONObject("emailAddress")?.optString("address") ?: "Unknown"
+                            } catch (e: Exception) {
+                                Log.w(TAG, "Error parsing sender for email $messageId: ${e.message}")
+                            }
+                            val receivedDateTime = msg.optString("receivedDateTime", "")
+
+                            Log.d(TAG, "Processing email: $subject from $sender (ID: $messageId)")
+
+                            val wasCleaned = classifyAndProcessEmail(
+                                subject,
+                                bodyPreview,
+                                messageId,
+                                accessToken ?: "",
+                                sender,
+                                receivedDateTime
+                            )
+
+                            Pair(messageId, wasCleaned)
                         }
-                    )
+                    }
+
+                    val results = processingJobs.awaitAll()
+
+                    val cleanedInBatch = results.count { it.second }
+                    val processedInBatch = results.size
+
+                    totalEmailsProcessed += processedInBatch
+                    totalEmailsCleaned += cleanedInBatch
+
+                    Log.d(TAG, "Batch complete. Processed: $processedInBatch, Cleaned: $cleanedInBatch. " +
+                             "Totals - Processed: $totalEmailsProcessed, Cleaned: $totalEmailsCleaned")
+
+                    updateProcessingStatus("Processed: $totalEmailsProcessed\nCleaned: $totalEmailsCleaned")
                 }
             },
             onProgress = { processed, total ->
                 Log.d(TAG, "Pagination progress: $processed/$total")
             },
             onComplete = {
-                Log.d(TAG, "Email pagination complete. Total processed: $totalEmailsProcessed")
+                Log.d(TAG, "Email pagination complete. Total fetched matches processed: $totalEmailsProcessed")
                 completeProcessing()
             },
             onError = { error ->
                 Log.e(TAG, "Error in email pagination: $error")
                 runOnUiThread {
                     Toast.makeText(this, "Error fetching emails: $error", Toast.LENGTH_SHORT).show()
-                    completeProcessing()
+                    completeProcessing(false)
                 }
             }
         )
     }
 
-    private fun completeProcessing() {
-        // Save the time of this cleaning operation
-        val app = applicationContext as MainApplication
-        app.preferencesManager.saveLastCleanTime()
+    private suspend fun classifyAndProcessEmail(
+        subject: String,
+        preview: String,
+        messageId: String,
+        accessToken: String,
+        sender: String,
+        receivedDateTime: String
+    ): Boolean {
+        val useOpenAI = !(!BuildConfig.DEBUG || System.currentTimeMillis() % 3 == 0L)
+        val apiKey = BuildConfig.OPENAI_API_KEY ?: ""
+        val canUseOpenAI = useOpenAI && apiKey.isNotEmpty() && apiKey != "YOUR_API_KEY_HERE"
+
+        return if (canUseOpenAI) {
+            try {
+                classifyEmailWithOpenAI(subject, preview, messageId, accessToken, sender, receivedDateTime)
+            } catch (e: Exception) {
+                Log.e(TAG, "OpenAI classification failed for $messageId, using fallback: ${e.message}", e)
+                classifyEmailWithFallback(subject, preview, messageId, accessToken, sender, receivedDateTime)
+            }
+        } else {
+            if (!canUseOpenAI && useOpenAI) {
+                 Log.w(TAG, "OpenAI API key is missing or invalid, using fallback classification for $messageId")
+            }
+            classifyEmailWithFallback(subject, preview, messageId, accessToken, sender, receivedDateTime)
+        }
+    }
+
+    private suspend fun classifyEmailWithOpenAI(
+        subject: String,
+        preview: String,
+        messageId: String,
+        accessToken: String,
+        sender: String,
+        receivedDateTime: String
+    ): Boolean = suspendCancellableCoroutine { continuation ->
+        val client = OkHttpClient.Builder()
+            .connectTimeout(30, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
+            .writeTimeout(30, TimeUnit.SECONDS)
+            .build()
+        val apiKey = BuildConfig.OPENAI_API_KEY ?: ""
+
+        val messagesArray = JSONArray().apply {
+            put(JSONObject().apply {
+                put("role", "user")
+                put("content", """
+                    Analyze this email to determine if it's unwanted content. Categorize it as one of the following:
+                    1. SPAM - unsolicited commercial messages, scams, or harmful content
+                    2. PROMOTION - marketing emails, deals, advertising
+                    3. NEWSLETTER - subscription-based bulk emails
+                    4. IMPORTANT - personal or business emails that require attention
+                    5. OTHER - any other legitimate email
+
+                    Subject: $subject
+                    
+                    From: $sender
+                    
+                    Body: $preview
+                    
+                    Respond with ONLY ONE of these words: SPAM, PROMOTION, NEWSLETTER, IMPORTANT, OTHER
+                """.trimIndent())
+            })
+        }
         
+        val json = JSONObject().apply {
+            put("model", "gpt-4o-mini-2024-07-18")
+            put("messages", messagesArray)
+            put("temperature", 0.3) 
+            put("max_tokens", 10) 
+        }
+        
+        Log.d(TAG, "OpenAI request for $messageId: $json")
+        
+        val mediaType = "application/json".toMediaType()
+        val body = json.toString().toRequestBody(mediaType)
+        val request = Request.Builder()
+            .url("https://api.openai.com/v1/chat/completions")
+            .addHeader("Authorization", "Bearer $apiKey")
+            .addHeader("Content-Type", "application/json")
+            .post(body)
+            .build()
+
+        val call = client.newCall(request)
+
+        continuation.invokeOnCancellation {
+            call.cancel()
+        }
+
+        call.enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                if (continuation.isActive) {
+                    continuation.resumeWithException(e)
+                }
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+                if (!continuation.isActive) return
+                try {
+                    val responseBody = response.body?.string() ?: "{}"
+                    if (!response.isSuccessful) {
+                        throw IOException("OpenAI API error ${response.code}: $responseBody")
+                    }
+
+                    Log.d(TAG, "OpenAI response for $messageId: $responseBody")
+                    val respJson = JSONObject(responseBody)
+                    val classification = respJson
+                        .optJSONArray("choices")
+                        ?.optJSONObject(0)
+                        ?.optJSONObject("message")
+                        ?.optString("content")
+                        ?.trim()
+                        ?.uppercase() ?: "OTHER"
+
+                    Log.d(TAG, "Email $messageId classified via OpenAI as: $classification")
+
+                    if (classification in listOf("SPAM", "PROMOTION", "NEWSLETTER")) {
+                        activityScope.launch(emailProcessingDispatcher) {
+                           try {
+                                val moved = moveEmailToAICleanedFolder(
+                                    accessToken, messageId, classification.lowercase(),
+                                    subject, sender, receivedDateTime
+                                )
+                                if (continuation.isActive) continuation.resume(moved)
+                           } catch (moveError: Exception) {
+                               Log.e(TAG, "Error moving email $messageId after OpenAI classification: ${moveError.message}", moveError)
+                               if (continuation.isActive) continuation.resume(false)
+                           }
+                        }
+                    } else {
+                         if (continuation.isActive) continuation.resume(false)
+                    }
+                } catch (e: Exception) {
+                     if (continuation.isActive) continuation.resumeWithException(e)
+                } finally {
+                    response.close()
+                }
+            }
+        })
+    }
+
+    private suspend fun classifyEmailWithFallback(
+        subject: String,
+        preview: String,
+        messageId: String,
+        accessToken: String,
+        sender: String,
+        receivedDateTime: String
+    ): Boolean {
+        Log.d(TAG, "Using fallback classification for: $subject (ID: $messageId)")
+
+        val subjectLower = subject.lowercase()
+        val bodyLower = preview.lowercase()
+        val senderLower = sender.lowercase()
+        
+        val classification = when {
+            listOf("viagra", "lottery", "winner", "forex", "casino", "bitcoin", "investment opportunity", "crypto", "urgent", "prince").any { 
+                subjectLower.contains(it) || bodyLower.contains(it) 
+            } -> "spam"
+            listOf("newsletter", "weekly update", "digest", "bulletin", "subscribe", "unsubscribe").any { 
+                subjectLower.contains(it) || bodyLower.contains(it) 
+            } -> "newsletter"
+            listOf("sale", "discount", "offer", "deal", "promotion", "% off", "limited time", "buy now", "shop").any { 
+                subjectLower.contains(it) || bodyLower.contains(it) 
+            } -> "promotion"
+            senderLower.contains("marketing") || senderLower.contains("newsletter") || 
+            senderLower.contains("noreply") || senderLower.contains("no-reply") -> "newsletter"
+            else -> "important"
+        }
+
+        Log.d(TAG, "Fallback classification result for $messageId: $classification")
+
+        if (classification in listOf("spam", "newsletter", "promotion")) {
+            try {
+                return moveEmailToAICleanedFolder(
+                    accessToken, messageId, classification,
+                    subject, sender, receivedDateTime
+                )
+            } catch (e: Exception) {
+                 Log.e(TAG, "Error moving email $messageId during fallback: ${e.message}", e)
+                 return false
+            }
+        } else {
+            return false
+        }
+    }
+
+    private suspend fun moveEmailToAICleanedFolder(
+        accessToken: String,
+        messageId: String,
+        classification: String,
+        subject: String,
+        sender: String,
+        receivedDateTime: String
+    ): Boolean {
+        try {
+            var folderId = aiCleanedFolderIdCache
+            if (folderId == null) {
+                Log.d(TAG, "Cache miss for AI Cleaned folder ID. Finding or creating...")
+                folderId = findOrCreateFolder(accessToken, "AI Cleaned")
+                aiCleanedFolderIdCache = folderId
+                Log.d(TAG, "AI Cleaned folder ID cached: $folderId")
+            } else {
+                Log.d(TAG, "Using cached AI Cleaned folder ID: $folderId")
+            }
+
+            val (success, error) = GraphApiUtils.moveEmail(accessToken, messageId, folderId)
+
+            if (success) {
+                Log.d(TAG, "Successfully moved $messageId ($classification) to AI Cleaned folder.")
+                val cleaned = CleanedEmail(
+                    messageId = messageId,
+                    subject = subject,
+                    sender = sender,
+                    receivedDate = System.currentTimeMillis(),
+                    actionTaken = "moved",
+                    actionTimestamp = System.currentTimeMillis(),
+                    originalFolder = "inbox"
+                )
+                withContext(Dispatchers.IO) {
+                    (applicationContext as MainApplication).repository.insert(cleaned)
+                }
+                return true
+            } else {
+                Log.e(TAG, "Failed to move $messageId to AI Cleaned folder: $error")
+                return false
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error during moveEmailToAICleanedFolder for $messageId: ${e.message}", e)
+            return false
+        }
+    }
+
+    private suspend fun findOrCreateFolder(accessToken: String, folderName: String): String = withContext(Dispatchers.IO) {
+        val client = OkHttpClient()
+
+        suspend fun findFolder(): String? {
+            val findRequest = Request.Builder()
+                .url("https://graph.microsoft.com/v1.0/me/mailFolders?\$filter=displayName eq '$folderName'")
+                .addHeader("Authorization", "Bearer $accessToken")
+                .build()
+            try {
+                client.newCall(findRequest).execute().use { response ->
+                    if (response.isSuccessful) {
+                        val responseBody = response.body?.string()
+                        val folders = JSONObject(responseBody ?: "").optJSONArray("value")
+                        if (folders != null && folders.length() > 0) {
+                            val existingId = folders.getJSONObject(0).optString("id")
+                            if (existingId.isNotEmpty()) {
+                                Log.d(TAG, "Found existing folder '$folderName' with ID: $existingId")
+                                return existingId
+                            }
+                        }
+                    } else {
+                        Log.w(TAG, "Failed to query for folder '$folderName': ${response.code}")
+                    }
+                }
+            } catch (e: IOException) {
+                Log.e(TAG, "Network error finding folder '$folderName': ${e.message}", e)
+            }
+            return null
+        }
+
+        var folderId = findFolder()
+        if (folderId != null) {
+            return@withContext folderId
+        }
+
+        Log.d(TAG, "Folder '$folderName' not found, attempting to create.")
+        val mediaType = "application/json".toMediaType()
+        val createJson = JSONObject().apply { put("displayName", folderName) }
+        val createBody = createJson.toString().toRequestBody(mediaType)
+        val createRequest = Request.Builder()
+            .url("https://graph.microsoft.com/v1.0/me/mailFolders")
+            .addHeader("Authorization", "Bearer $accessToken")
+            .addHeader("Content-Type", "application/json")
+            .post(createBody)
+            .build()
+
+        try {
+            client.newCall(createRequest).execute().use { response ->
+                if (response.isSuccessful) {
+                    val responseBody = response.body?.string()
+                    val newId = JSONObject(responseBody ?: "").optString("id")
+                    if (newId.isNotEmpty()) {
+                        Log.d(TAG, "Successfully created folder '$folderName' with ID: $newId")
+                        return@withContext newId
+                    } else {
+                        throw IOException("Folder creation for '$folderName' returned empty ID.")
+                    }
+                } else {
+                     val errorBody = response.body?.string()
+                     if (response.code == 409 && errorBody?.contains("NameAlreadyExists", ignoreCase = true) == true) {
+                         Log.w(TAG,"Folder '$folderName' likely created concurrently. Retrying find.")
+                         delay(500)
+                         return@withContext findOrCreateFolder(accessToken, folderName)
+                     }
+                     throw IOException("Create folder '$folderName' failed: ${response.code} - $errorBody")
+                }
+            }
+        } catch (e: IOException) {
+             Log.e(TAG, "Error creating folder '$folderName': ${e.message}", e)
+             throw e
+        }
+    }
+
+    private fun completeProcessing(didProcess: Boolean = true) {
+        if (didProcess) {
+            val app = applicationContext as MainApplication
+            app.preferencesManager.saveLastCleanTime()
+        }
+
         runOnUiThread {
             buttonClean.isEnabled = true
             isProcessingEmails = false
-            
-            if (totalEmailsCleaned > 0) {
+
+            if (didProcess && totalEmailsCleaned > 0) {
                 showCleaningResultNotification(totalEmailsCleaned)
             }
-            
-            // Update status in UI
-            Toast.makeText(this, 
-                "Processed $totalEmailsProcessed emails, cleaned $totalEmailsCleaned", 
-                Toast.LENGTH_LONG).show()
-                
-            // Hide status after a delay
+
+            val message = if (didProcess) {
+                "Processed $totalEmailsProcessed emails, cleaned $totalEmailsCleaned"
+            } else {
+                "Processing stopped."
+            }
+            Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+
             textViewProcessingStatus.postDelayed({
                 textViewProcessingStatus.visibility = View.GONE
             }, 5000)
@@ -430,325 +738,6 @@ class DashboardActivity : AppCompatActivity() {
         }
     }
 
-    private fun classifyEmailWithOpenAI(
-        subject: String,
-        preview: String,
-        messageId: String,
-        accessToken: String,
-        sender: String,
-        receivedDateTime: String,
-        onComplete: (Boolean) -> Unit
-    ) {
-        // Check if we can use OpenAI API
-        if (!BuildConfig.DEBUG || System.currentTimeMillis() % 3 == 0L) {
-            // Use fallback classification for debugging or randomly in production
-            classifyEmailWithFallback(subject, preview, messageId, accessToken, sender, receivedDateTime, onComplete)
-            return
-        }
-    
-        val client = OkHttpClient.Builder()
-            .connectTimeout(30, TimeUnit.SECONDS)
-            .readTimeout(30, TimeUnit.SECONDS)
-            .writeTimeout(30, TimeUnit.SECONDS)
-            .build()
-            
-        // Check if OpenAI API key is empty or not set
-        val apiKey = BuildConfig.OPENAI_API_KEY ?: ""
-        if (apiKey.isEmpty() || apiKey == "YOUR_API_KEY_HERE") {
-            Log.w(TAG, "OpenAI API key is missing, using fallback classification")
-            classifyEmailWithFallback(subject, preview, messageId, accessToken, sender, receivedDateTime, onComplete)
-            return
-        }
-        
-        try {
-            val messagesArray = JSONArray().apply {
-                put(JSONObject().apply {
-                    put("role", "user")
-                    put("content", """
-                        Analyze this email to determine if it's unwanted content. Categorize it as one of the following:
-                        1. SPAM - unsolicited commercial messages, scams, or harmful content
-                        2. PROMOTION - marketing emails, deals, advertising
-                        3. NEWSLETTER - subscription-based bulk emails
-                        4. IMPORTANT - personal or business emails that require attention
-                        5. OTHER - any other legitimate email
-
-                        Subject: $subject
-                        
-                        From: $sender
-                        
-                        Body: $preview
-                        
-                        Respond with ONLY ONE of these words: SPAM, PROMOTION, NEWSLETTER, IMPORTANT, OTHER
-                    """.trimIndent())
-                })
-            }
-            
-            val json = JSONObject().apply {
-                put("model", "gpt-4o-mini-2024-07-18")
-                put("messages", messagesArray)
-                put("temperature", 0.3) // Lower temperature for more focused results
-                put("max_tokens", 10) // We only need a single word response
-            }
-            
-            Log.d(TAG, "OpenAI request: $json")
-            
-            val mediaType = "application/json".toMediaType()
-            val body = json.toString().toRequestBody(mediaType)
-            val request = Request.Builder()
-                .url("https://api.openai.com/v1/chat/completions")
-                .addHeader("Authorization", "Bearer $apiKey")
-                .addHeader("Content-Type", "application/json")
-                .post(body)
-                .build()
-
-            client.newCall(request).enqueue(object : Callback {
-                override fun onFailure(call: Call, e: IOException) {
-                    Log.e(TAG, "OpenAI API call failed: ${e.message}", e)
-                    runOnUiThread {
-                        Toast.makeText(this@DashboardActivity, 
-                            "AI classification failed: ${e.message?.take(50)}", 
-                            Toast.LENGTH_SHORT).show()
-                    }
-                    onComplete(false)
-                }
-                
-                override fun onResponse(call: Call, response: Response) {
-                    val responseBody = response.body?.string() ?: "{}"
-                    
-                    if (!response.isSuccessful) {
-                        Log.e(TAG, "OpenAI API error ${response.code}: $responseBody")
-                        runOnUiThread {
-                            Toast.makeText(this@DashboardActivity, 
-                                "AI error: ${response.code} - ${responseBody.take(50)}", 
-                                Toast.LENGTH_SHORT).show()
-                        }
-                        onComplete(false)
-                        return
-                    }
-                    
-                    try {
-                        Log.d(TAG, "OpenAI response: $responseBody")
-                        val respJson = JSONObject(responseBody)
-                        val classification = respJson
-                            .optJSONArray("choices")
-                            ?.optJSONObject(0)
-                            ?.optJSONObject("message")
-                            ?.optString("content")
-                            ?.trim()
-                            ?.uppercase() ?: "OTHER"
-                        
-                        Log.d(TAG, "Email classified as: $classification - Subject: $subject")
-                        
-                        when (classification) {
-                            "SPAM", "PROMOTION", "NEWSLETTER" -> {
-                                moveEmailToAICleanedFolder(
-                                    accessToken, 
-                                    messageId,
-                                    classification.lowercase(),
-                                    subject,
-                                    sender,
-                                    receivedDateTime,
-                                    onSuccess = { 
-                                        onComplete(true)
-                                    },
-                                    onError = { e -> 
-                                        Log.e(TAG, "Error moving email: $e") 
-                                        onComplete(false)
-                                    }
-                                )
-                            }
-                            else -> onComplete(false)
-                        }
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Error processing OpenAI response: ${e.message}", e)
-                        runOnUiThread {
-                            Toast.makeText(this@DashboardActivity, 
-                                "Error processing AI response: ${e.message?.take(50)}", 
-                                Toast.LENGTH_SHORT).show()
-                        }
-                        onComplete(false)
-                    }
-                }
-            })
-        } catch (e: Exception) {
-            Log.e(TAG, "Error setting up OpenAI request: ${e.message}", e)
-            runOnUiThread {
-                Toast.makeText(this, "AI setup error: ${e.message?.take(50)}", Toast.LENGTH_SHORT).show()
-            }
-            onComplete(false)
-        }
-    }
-    
-    /**
-     * Fallback email classification method when OpenAI is not available
-     */
-    private fun classifyEmailWithFallback(
-        subject: String,
-        preview: String,
-        messageId: String,
-        accessToken: String,
-        sender: String,
-        receivedDateTime: String,
-        onComplete: (Boolean) -> Unit
-    ) {
-        Log.d(TAG, "Using fallback classification for: $subject")
-        
-        // Simple rule-based classification for testing
-        val subjectLower = subject.lowercase()
-        val bodyLower = preview.lowercase()
-        val senderLower = sender.lowercase()
-        
-        // Determine classification based on simple rules
-        val classification = when {
-            // Spam indicators
-            listOf("viagra", "lottery", "winner", "forex", "casino", "bitcoin", "investment opportunity", "crypto", "urgent", "prince").any { 
-                subjectLower.contains(it) || bodyLower.contains(it) 
-            } -> "spam"
-            
-            // Newsletter indicators
-            listOf("newsletter", "weekly update", "digest", "bulletin", "subscribe", "unsubscribe").any { 
-                subjectLower.contains(it) || bodyLower.contains(it) 
-            } -> "newsletter"
-            
-            // Promotion indicators
-            listOf("sale", "discount", "offer", "deal", "promotion", "% off", "limited time", "buy now", "shop").any { 
-                subjectLower.contains(it) || bodyLower.contains(it) 
-            } -> "promotion"
-            
-            // Consider sender domain
-            senderLower.contains("marketing") || senderLower.contains("newsletter") || 
-            senderLower.contains("noreply") || senderLower.contains("no-reply") -> "newsletter"
-            
-            // Otherwise, leave it alone (important)
-            else -> "important"
-        }
-        
-        Log.d(TAG, "Fallback classification result: $classification for $subject")
-        
-        // Only move emails that are considered unwanted
-        if (classification in listOf("spam", "newsletter", "promotion")) {
-            moveEmailToAICleanedFolder(
-                accessToken,
-                messageId,
-                classification,
-                subject,
-                sender,
-                receivedDateTime,
-                onSuccess = { onComplete(true) },
-                onError = { error -> 
-                    Log.e(TAG, "Error moving email: $error")
-                    onComplete(false)
-                }
-            )
-        } else {
-            // Email is important, skip it
-            onComplete(false)
-        }
-    }
-
-    private fun moveEmailToAICleanedFolder(
-        accessToken: String,
-        messageId: String,
-        classification: String,
-        subject: String,
-        sender: String,
-        receivedDateTime: String,
-        onSuccess: () -> Unit,
-        onError: (String) -> Unit
-    ) {
-        val client = OkHttpClient()
-        client.newCall(
-            Request.Builder()
-                .url("https://graph.microsoft.com/v1.0/me/mailFolders")
-                .addHeader("Authorization", "Bearer $accessToken")
-                .build()
-        ).enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) = onError("Folders load failed: ${e.message}")
-            override fun onResponse(call: Call, response: Response) {
-                if (!response.isSuccessful) return onError("Folders load failed: ${response.code}")
-                val folders = JSONObject(response.body?.string() ?: "").optJSONArray("value")
-                val folderId = (0 until (folders?.length() ?: 0))
-                    .map { folders!!.getJSONObject(it) }
-                    .firstOrNull { it.optString("displayName") == "AI Cleaned" }
-                    ?.optString("id")
-                if (folderId != null) {
-                    moveEmailToFolder(accessToken, messageId, folderId, classification, subject, sender, receivedDateTime, onSuccess, onError)
-                } else {
-                    val mediaType = "application/json".toMediaType()
-                    val createJson = JSONObject()
-                    createJson.put("displayName", "AI Cleaned")
-                    val body = createJson.toString().toRequestBody(mediaType)
-                    
-                    client.newCall(
-                        Request.Builder()
-                            .url("https://graph.microsoft.com/v1.0/me/mailFolders")
-                            .addHeader("Authorization", "Bearer $accessToken")
-                            .addHeader("Content-Type", "application/json")
-                            .post(body)
-                            .build()
-                    ).enqueue(object : Callback {
-                        override fun onFailure(call: Call, e: IOException) = onError("Create folder failed: ${e.message}")
-                        override fun onResponse(call: Call, response: Response) {
-                            if (!response.isSuccessful) return onError("Create folder failed: ${response.code}")
-                            val newId = JSONObject(response.body?.string() ?: "").optString("id")
-                            if (newId.isNotEmpty()) 
-                                moveEmailToFolder(accessToken, messageId, newId, classification, subject, sender, receivedDateTime, onSuccess, onError)
-                            else onError("Folder creation returned empty ID")
-                        }
-                    })
-                }
-            }
-        })
-    }
-
-    private fun moveEmailToFolder(
-        accessToken: String,
-        messageId: String,
-        folderId: String,
-        classification: String,
-        subject: String,
-        sender: String,
-        receivedDateTime: String,
-        onSuccess: () -> Unit,
-        onError: (String) -> Unit
-    ) {
-        val mediaType = "application/json".toMediaType()
-        val jsonBody = JSONObject()
-        jsonBody.put("destinationId", folderId)
-        val body = jsonBody.toString().toRequestBody(mediaType)
-        
-        OkHttpClient().newCall(
-            Request.Builder()
-                .url("https://graph.microsoft.com/v1.0/me/messages/$messageId/move")
-                .addHeader("Authorization", "Bearer $accessToken")
-                .addHeader("Content-Type", "application/json")
-                .post(body)
-                .build()
-        ).enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) = onError("Move failed: ${e.message}")
-            override fun onResponse(call: Call, response: Response) {
-                if (response.isSuccessful) {
-                    // Store the cleaned email in the database
-                    val cleaned = CleanedEmail(
-                        messageId = messageId,
-                        subject = subject,
-                        sender = sender,
-                        receivedDate = System.currentTimeMillis(),
-                        actionTaken = "moved",
-                        actionTimestamp = System.currentTimeMillis(),
-                        originalFolder = "inbox"
-                    )
-                    CoroutineScope(Dispatchers.IO).launch {
-                        (applicationContext as MainApplication).repository.insert(cleaned)
-                    }
-                    onSuccess()
-                } else {
-                    onError("Move failed: ${response.code}")
-                }
-            }
-        })
-    }
-
     private fun sendSmtpNotification(subject: String, body: String) {
         Thread {
             try {
@@ -777,9 +766,6 @@ class DashboardActivity : AppCompatActivity() {
         }.start()
     }
 
-    /**
-     * Show a dialog to let the user choose cleaning options
-     */
     private fun showCleaningOptionsDialog() {
         val options = arrayOf(
             "Smart Clean (Only New Emails)",
@@ -792,17 +778,14 @@ class DashboardActivity : AppCompatActivity() {
             .setItems(options) { _, which ->
                 when (which) {
                     0 -> {
-                        // Smart clean - use existing last clean timestamp
                         acquireTokenAndCleanEmails()
                     }
                     1 -> {
-                        // Full clean - reset the last clean time and process all emails
                         val app = applicationContext as MainApplication
-                        app.preferencesManager.saveLastCleanTime(0) // Reset to epoch time
+                        app.preferencesManager.saveLastCleanTime(0)
                         acquireTokenAndCleanEmails()
                     }
                     2 -> {
-                        // Set email limit
                         showSetEmailLimitDialog()
                     }
                 }
@@ -811,9 +794,6 @@ class DashboardActivity : AppCompatActivity() {
             .show()
     }
     
-    /**
-     * Show a dialog to let the user set the maximum number of emails to process
-     */
     private fun showSetEmailLimitDialog() {
         val app = applicationContext as MainApplication
         val currentLimit = app.preferencesManager.getMaxEmailsToProcess()
@@ -826,7 +806,7 @@ class DashboardActivity : AppCompatActivity() {
             200 -> 3
             500 -> 4
             1000 -> 5
-            else -> 2 // Default to 100
+            else -> 2
         }
         
         AlertDialog.Builder(this)

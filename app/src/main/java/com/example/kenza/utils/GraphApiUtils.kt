@@ -2,6 +2,7 @@ package com.example.kenza.utils
 
 import android.net.Uri
 import android.util.Log
+import kotlinx.coroutines.delay
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -9,10 +10,13 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
 import java.net.URLDecoder
+import kotlin.math.pow
 
 class GraphApiUtils {
     companion object {
         private const val TAG = "GraphApiUtils"
+        private const val MAX_RETRIES = 5 // Max number of retries for rate limiting
+        private const val INITIAL_DELAY_MS = 1000L // Initial delay in milliseconds
         
         /**
          * Fetches email pages from Microsoft Graph with pagination support.
@@ -159,10 +163,14 @@ class GraphApiUtils {
             fetchPage()
         }
 
-        fun deleteEmail(accessToken: String, messageId: String, callback: (Boolean, String?) -> Unit) {
+        suspend fun deleteEmail(
+            accessToken: String,
+            messageId: String,
+            retryCount: Int = 0
+        ): Pair<Boolean, String?> {
             val client = OkHttpClient()
             val requestUrl = "https://graph.microsoft.com/v1.0/me/messages/$messageId"
-            Log.d(TAG, "Attempting to delete email: $messageId")
+            Log.d(TAG, "Attempting to delete email: $messageId (Retry: $retryCount)")
 
             val request = Request.Builder()
                 .url(requestUrl)
@@ -170,30 +178,88 @@ class GraphApiUtils {
                 .addHeader("Authorization", "Bearer $accessToken")
                 .build()
 
-            client.newCall(request).enqueue(object : Callback {
-                override fun onFailure(call: Call, e: IOException) {
-                    Log.e(TAG, "Failed to delete email $messageId: ${e.message}", e)
-                    callback(false, e.message ?: "Network error")
-                }
+            try {
+                val response = client.newCall(request).execute()
 
-                override fun onResponse(call: Call, response: Response) {
-                    if (response.isSuccessful) {
+                return response.use {
+                    if (it.isSuccessful) {
                         Log.d(TAG, "Successfully deleted email $messageId")
-                        callback(true, null)
+                        Pair(true, null)
                     } else {
-                        val errorBody = response.body?.string()
-                        Log.e(TAG, "Error deleting email $messageId: ${response.code} - $errorBody")
-                        callback(false, "Error ${response.code}: $errorBody")
+                        val errorBody = it.body?.string()
+                        Log.e(TAG, "Error deleting email $messageId: ${it.code} - $errorBody")
+
+                        if (it.code == 429 && retryCount < MAX_RETRIES) {
+                            val retryAfterSeconds = it.header("Retry-After", "1")?.toIntOrNull() ?: 1
+                            val delayMs = (INITIAL_DELAY_MS * 2.0.pow(retryCount)).toLong() + (retryAfterSeconds * 1000L)
+                            Log.w(TAG, "Rate limit hit for $messageId. Retrying after ${delayMs}ms...")
+                            delay(delayMs)
+                            deleteEmail(accessToken, messageId, retryCount + 1)
+                        } else {
+                            Pair(false, "Error ${it.code}: $errorBody")
+                        }
                     }
-                    response.close()
                 }
-            })
+            } catch (e: IOException) {
+                Log.e(TAG, "Failed to delete email $messageId: ${e.message}", e)
+                return Pair(false, e.message ?: "Network error")
+            }
         }
 
-        fun unsubscribe(accessToken: String, messageId: String, callback: (Boolean, String?) -> Unit) {
+        suspend fun moveEmail(
+            accessToken: String,
+            messageId: String,
+            destinationFolderId: String,
+            retryCount: Int = 0
+        ): Pair<Boolean, String?> {
             val client = OkHttpClient()
+            val requestUrl = "https://graph.microsoft.com/v1.0/me/messages/$messageId/move"
+            Log.d(TAG, "Attempting to move email: $messageId to folder $destinationFolderId (Retry: $retryCount)")
+
+            val mediaType = "application/json".toMediaType()
+            val jsonBody = JSONObject().apply {
+                put("destinationId", destinationFolderId)
+            }
+            val body = jsonBody.toString().toRequestBody(mediaType)
+
+            val request = Request.Builder()
+                .url(requestUrl)
+                .addHeader("Authorization", "Bearer $accessToken")
+                .addHeader("Content-Type", "application/json")
+                .post(body)
+                .build()
+
+            try {
+                val response = client.newCall(request).execute()
+
+                return response.use {
+                    if (it.isSuccessful) {
+                        Log.d(TAG, "Successfully moved email $messageId")
+                        Pair(true, null)
+                    } else {
+                        val errorBody = it.body?.string()
+                        Log.e(TAG, "Error moving email $messageId: ${it.code} - $errorBody")
+
+                        if (it.code == 429 && retryCount < MAX_RETRIES) {
+                            val retryAfterSeconds = it.header("Retry-After", "1")?.toIntOrNull() ?: 1
+                            val delayMs = (INITIAL_DELAY_MS * 2.0.pow(retryCount)).toLong() + (retryAfterSeconds * 1000L)
+                            Log.w(TAG, "Rate limit hit moving $messageId. Retrying after ${delayMs}ms...")
+                            delay(delayMs)
+                            moveEmail(accessToken, messageId, destinationFolderId, retryCount + 1)
+                        } else {
+                            Pair(false, "Error ${it.code}: $errorBody")
+                        }
+                    }
+                }
+            } catch (e: IOException) {
+                Log.e(TAG, "Network error moving email $messageId: ${e.message}", e)
+                return Pair(false, e.message ?: "Network error")
+            }
+        }
+
+        suspend fun unsubscribe(accessToken: String, messageId: String): Pair<Boolean, String?> {
             Log.w(TAG, "Unsubscribe functionality is not implemented via Graph API directly for message $messageId.")
-            callback(false, "Unsubscribe not implemented")
+            return Pair(false, "Unsubscribe not implemented")
         }
     }
 }
