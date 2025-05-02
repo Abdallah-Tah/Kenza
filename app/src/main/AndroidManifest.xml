@@ -18,6 +18,18 @@
         android:theme="@style/Theme.Kenza"
         tools:targetApi="31">
 
+        <!-- Disable the default WorkManager initialization -->
+        <provider
+            android:name="androidx.startup.InitializationProvider"
+            android:authorities="${applicationId}.androidx-startup"
+            android:exported="false"
+            tools:node="merge">
+            <meta-data
+                android:name="androidx.work.WorkManagerInitializer"
+                android:value="androidx.startup"
+                tools:node="remove" />
+        </provider>
+
         <!-- MainActivity is the launcher -->
         <activity
             android:name=".MainActivity"

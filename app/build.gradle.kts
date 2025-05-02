@@ -4,12 +4,13 @@ plugins {
     id("org.jetbrains.kotlin.kapt")
 }
 
-// Read OpenAI API key from local.properties or provide empty default
-val openAIApiKey = try {
-    project.findProperty("openai.api.key")?.toString() ?: ""
-} catch (e: Exception) {
-    ""
+// Read OpenAI API key directly from local.properties
+val localPropertiesFile = rootProject.file("local.properties")
+val properties = org.jetbrains.kotlin.konan.properties.Properties()
+if (localPropertiesFile.exists()) {
+    properties.load(localPropertiesFile.inputStream())
 }
+val openAIApiKey = properties.getProperty("OPENAI_API_KEY") ?: ""
 
 android {
     namespace = "com.example.kenza"
@@ -50,6 +51,8 @@ android {
     }
     kotlinOptions {
         jvmTarget = "11"
+        // Correct the opt-in class name
+        freeCompilerArgs = (freeCompilerArgs ?: listOf()) + "-Xopt-in=kotlin.ExperimentalStdlibApi"
     }
     buildFeatures {
         viewBinding = true

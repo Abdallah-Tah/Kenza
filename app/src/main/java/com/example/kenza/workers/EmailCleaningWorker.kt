@@ -13,11 +13,9 @@ import com.microsoft.identity.client.ISingleAccountPublicClientApplication
 import com.microsoft.identity.client.AcquireTokenSilentParameters
 import com.microsoft.identity.client.SilentAuthenticationCallback
 import com.microsoft.identity.client.exception.MsalException
+import kotlinx.coroutines.*
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.coroutines.resume
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.*
 import com.example.kenza.database.models.CleanedEmail
@@ -68,6 +66,11 @@ class EmailCleaningWorker(appContext: Context, workerParams: WorkerParameters) :
             var totalProcessed = 0
             var totalCleaned = 0
 
+            // Create a coroutine scope tied to our worker
+            val processingScope = CoroutineScope(Dispatchers.IO + Job())
+
+            val processedMessages = mutableListOf<Deferred<Pair<Boolean, Boolean>>>() // (processed, cleaned)
+
             // Process emails in the background
             withContext(Dispatchers.IO) {
                 GraphApiUtils.fetchGraphEmailPages(
@@ -77,12 +80,11 @@ class EmailCleaningWorker(appContext: Context, workerParams: WorkerParameters) :
                     batchSize = 50,
                     maxEmails = maxEmails,
                     initialSkipToken = null,
-                    initialIsSkipParameter = false,
                     onBatch = { messages ->
                         val messageCount = messages.length()
                         Log.d(TAG, "Worker received batch of $messageCount emails")
                         
-                        // Process each email in the batch
+                        // Process each email in the batch using async to handle suspend functions
                         for (i in 0 until messageCount) {
                             val msg = messages.getJSONObject(i)
                             val messageId = msg.optString("id")
@@ -92,57 +94,69 @@ class EmailCleaningWorker(appContext: Context, workerParams: WorkerParameters) :
                                 ?.optString("address")?.lowercase() ?: "unknown"
                             val receivedDateTime = msg.optString("receivedDateTime", "")
 
-                            // Skip emails from excluded senders
-                            if (exclusionSenders.any { 
-                                sender == it.lowercase() || 
-                                sender.endsWith("@${it.lowercase()}") || 
-                                sender.contains(it.lowercase()) 
-                            }) {
-                                Log.d(TAG, "Worker skipping $messageId from $sender due to exclusion rule.")
-                                totalProcessed++
-                                continue
-                            }
+                            // Launch an async task for each email
+                            val processTask = processingScope.async {
+                                // Skip emails from excluded senders
+                                if (exclusionSenders.any { 
+                                    sender == it.lowercase() || 
+                                    sender.endsWith("@${it.lowercase()}") || 
+                                    sender.contains(it.lowercase()) 
+                                }) {
+                                    Log.d(TAG, "Worker skipping $messageId from $sender due to exclusion rule.")
+                                    Pair(true, false) // processed but not cleaned
+                                } else {
+                                    // Classify and process the email
+                                    val classification = classifyEmailWithFallback(subject, bodyPreview, sender)
+                                    Log.d(TAG, "Worker classified $messageId as: $classification")
 
-                            // Classify and process the email
-                            // This is a simplified version of what's in DashboardActivity
-                            val classification = classifyEmailWithFallback(subject, bodyPreview, sender)
-                            Log.d(TAG, "Worker classified $messageId as: $classification")
-
-                            if (classification in listOf("spam", "newsletter", "promotion", "unsubscribe")) {
-                                val folderName = if (classification == "unsubscribe") "AI Unsubscribed" else "AI Cleaned"
-                                val actionType = if (classification == "unsubscribe") "unsubscribed" else "moved"
-                                
-                                // Try to find or create the folder and move the email
-                                try {
-                                    val folderMoved = moveEmailToFolder(
-                                        accessToken, messageId, folderName, actionType,
-                                        subject, sender, receivedDateTime
-                                    )
-                                    if (folderMoved) {
-                                        totalCleaned++
-                                        Log.d(TAG, "Worker successfully processed email $messageId as $classification")
+                                    if (classification in listOf("spam", "newsletter", "promotion", "unsubscribe")) {
+                                        val folderName = if (classification == "unsubscribe") "AI Unsubscribed" else "AI Cleaned"
+                                        val actionType = if (classification == "unsubscribe") "unsubscribed" else "moved"
+                                        
+                                        try {
+                                            val folderMoved = moveEmailToFolder(
+                                                accessToken, messageId, folderName, actionType,
+                                                subject, sender, receivedDateTime
+                                            )
+                                            if (folderMoved) {
+                                                Log.d(TAG, "Worker successfully processed email $messageId as $classification")
+                                                Pair(true, true) // processed and cleaned
+                                            } else {
+                                                Log.e(TAG, "Worker failed to move email $messageId to $folderName")
+                                                Pair(true, false) // processed but not cleaned
+                                            }
+                                        } catch (e: Exception) {
+                                            Log.e(TAG, "Error during email $messageId processing: ${e.message}", e)
+                                            Pair(true, false) // processed but not cleaned
+                                        }
                                     } else {
-                                        Log.e(TAG, "Worker failed to move email $messageId to $folderName")
+                                        Pair(true, false) // processed but not cleaned
                                     }
-                                } catch (e: Exception) {
-                                    Log.e(TAG, "Error during email $messageId processing: ${e.message}", e)
                                 }
                             }
-                            
-                            totalProcessed++
+                            processedMessages.add(processTask)
                         }
                     },
                     onProgress = { processed, total -> 
                         Log.d(TAG, "Worker pagination progress: $processed/$total") 
                     },
                     onComplete = { 
-                        Log.d(TAG, "Worker pagination complete. Total processed: $totalProcessed, Cleaned: $totalCleaned") 
+                        // Wait for all processing tasks to complete
+                        runBlocking {
+                            val results = processedMessages.awaitAll()
+                            totalProcessed = results.count { it.first }
+                            totalCleaned = results.count { it.second }
+                            Log.d(TAG, "Worker pagination complete. Total processed: $totalProcessed, Cleaned: $totalCleaned")
+                        }
                     },
                     onError = { error -> 
                         Log.e(TAG, "Worker pagination error: $error") 
                     }
                 )
             }
+            
+            // Cancel our processing scope
+            processingScope.cancel()
 
             // Update last clean time in preferences
             preferencesManager.saveLastCleanTime()
@@ -156,7 +170,7 @@ class EmailCleaningWorker(appContext: Context, workerParams: WorkerParameters) :
 
     // Helper to get authentication token silently
     private suspend fun acquireTokenSilently(msalInstance: ISingleAccountPublicClientApplication): String? =
-        suspendCancellableCoroutine { continuation ->
+        suspendCancellableCoroutine { continuation -> 
             msalInstance.getCurrentAccountAsync(object : ISingleAccountPublicClientApplication.CurrentAccountCallback {
                 override fun onAccountLoaded(activeAccount: IAccount?) {
                     if (activeAccount == null) {
@@ -278,8 +292,8 @@ class EmailCleaningWorker(appContext: Context, workerParams: WorkerParameters) :
     private suspend fun findOrCreateFolder(accessToken: String, folderName: String): String = withContext(Dispatchers.IO) {
         val client = OkHttpClient()
 
-        // Helper function to find a folder by name
-        suspend fun findFolder(): String? {
+        // Helper function to find a folder by name - removed unnecessary suspend modifier
+        fun findFolder(): String? {
             val findRequest = Request.Builder()
                 .url("https://graph.microsoft.com/v1.0/me/mailFolders?\$filter=displayName eq '$folderName'")
                 .addHeader("Authorization", "Bearer $accessToken")
@@ -307,7 +321,7 @@ class EmailCleaningWorker(appContext: Context, workerParams: WorkerParameters) :
         }
 
         // First attempt to find the folder
-        var folderId = findFolder()
+        val folderId = findFolder()
         if (folderId != null) {
             return@withContext folderId
         }
@@ -336,26 +350,26 @@ class EmailCleaningWorker(appContext: Context, workerParams: WorkerParameters) :
                         throw IOException("Worker folder creation for '$folderName' returned empty ID.")
                     }
                 } else {
-                     val errorBody = response.body?.string()
-                     // Handle conflict (409) - another request may have created the folder already
-                     if (response.code == 409 && errorBody?.contains("NameAlreadyExists", ignoreCase = true) == true) {
-                         Log.w(TAG,"Worker: Folder '$folderName' likely created concurrently. Retrying find.")
-                         delay(500)
-                         // Try finding it again after a short delay
-                         folderId = findFolder()
-                         if (folderId != null) {
-                             return@withContext folderId
-                         } else {
-                             throw IOException("Worker: Folder '$folderName' creation failed with 409, but couldn't find it immediately after.")
-                         }
-                     } else {
+                    val errorBody = response.body?.string()
+                    // Handle conflict (409) - another request may have created the folder already
+                    if (response.code == 409 && errorBody?.contains("NameAlreadyExists", ignoreCase = true) == true) {
+                        Log.w(TAG, "Worker: Folder '$folderName' likely created concurrently. Retrying find.")
+                        delay(500)
+                        // Try finding it again after a short delay - need to use a new variable name to avoid smart cast issue
+                        val retryFolderId = findFolder()
+                        if (retryFolderId != null) {
+                            return@withContext retryFolderId
+                        } else {
+                            throw IOException("Worker: Folder '$folderName' creation failed with 409, but couldn't find it immediately after.")
+                        }
+                    } else {
                         throw IOException("Worker: Create folder '$folderName' failed: ${response.code} - $errorBody")
-                     }
+                    }
                 }
             }
         } catch (e: IOException) {
-             Log.e(TAG, "Worker error creating folder '$folderName': ${e.message}", e)
-             throw e
+            Log.e(TAG, "Worker error creating folder '$folderName': ${e.message}", e)
+            throw e
         }
     }
 }

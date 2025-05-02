@@ -49,13 +49,15 @@ import androidx.core.app.NotificationManagerCompat
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
+import android.net.ConnectivityManager
 import android.os.Build
 import android.view.View
 import java.text.SimpleDateFormat
 import java.util.*
 import com.example.kenza.utils.GraphApiUtils
+import com.example.kenza.utils.GraphEmailService
+import com.example.kenza.utils.GraphApiProvider
 import kotlinx.coroutines.delay
-
 
 class DashboardActivity : AppCompatActivity() {
     private lateinit var buttonClean: Button
@@ -66,7 +68,8 @@ class DashboardActivity : AppCompatActivity() {
     private lateinit var textViewCountUnsub: TextView
     private lateinit var textViewEmail: TextView
     private lateinit var textViewProcessingStatus: TextView
-    
+    private lateinit var graphApiService: com.example.kenza.utils.GraphEmailService  // Changed from network.GraphApiService to utils.GraphEmailService
+
     // Email processing state
     private var isProcessingEmails = false
     private var totalEmailsProcessed = 0
@@ -74,6 +77,9 @@ class DashboardActivity : AppCompatActivity() {
     private var totalEmailsCleaned = 0
     private var accessToken: String? = null
     private var aiCleanedFolderIdCache: String? = null // Cache for the folder ID
+
+    // Email processing queue
+    private var emailProcessingQueue: com.example.kenza.utils.EmailProcessingQueue? = null
 
     private val activityScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private val emailProcessingDispatcher = Dispatchers.IO.limitedParallelism(5)
@@ -90,9 +96,16 @@ class DashboardActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_dashboard)
-        
+
+        // Debug: Check if API key is available
+        val apiKey = BuildConfig.OPENAI_API_KEY
+        Log.d(TAG, "OpenAI API key is ${if (apiKey.isNotEmpty()) "available" else "missing"} (length: ${apiKey.length})")
+
         createNotificationChannel()
-        
+
+        // Corrected: Use graphEmailService instead of graphApiService
+        graphApiService = GraphApiProvider.graphEmailService
+
         buttonClean = findViewById(R.id.buttonClean)
         buttonViewBinRecovery = findViewById(R.id.buttonViewBinRecovery)
         buttonViewProfile = findViewById(R.id.buttonViewProfile)
@@ -102,7 +115,7 @@ class DashboardActivity : AppCompatActivity() {
         textViewCountUnsub = findViewById(R.id.textViewCountUnsub)
         textViewEmail = findViewById(R.id.textViewEmail)
         textViewProcessingStatus = findViewById(R.id.textViewProcessingStatus)
-        
+
         textViewProcessingStatus.visibility = View.GONE
 
         val app = applicationContext as MainApplication
@@ -138,15 +151,15 @@ class DashboardActivity : AppCompatActivity() {
         buttonViewBinRecovery.setOnClickListener {
             startActivity(Intent(this, BinRecoveryActivity::class.java))
         }
-        
+
         buttonViewProfile.setOnClickListener {
             Toast.makeText(this, "View Profile not yet implemented.", Toast.LENGTH_SHORT).show()
         }
-        
+
         buttonSettings.setOnClickListener {
             startActivity(Intent(this, SettingsActivity::class.java))
         }
-        
+
         buttonSignOut.setOnClickListener {
             msalInstance?.signOut(object : ISingleAccountPublicClientApplication.SignOutCallback {
                 override fun onSignOut() {
@@ -160,7 +173,7 @@ class DashboardActivity : AppCompatActivity() {
                 }
             })
         }
-        
+
         // Check for emails older than 30 days and schedule for deletion
         checkAndPurgeOldEmails()
     }
@@ -182,21 +195,21 @@ class DashboardActivity : AppCompatActivity() {
             notificationManager.createNotificationChannel(channel)
         }
     }
-    
+
     private fun checkAndPurgeOldEmails() {
         lifecycleScope.launch(Dispatchers.IO) {
             val repository = (applicationContext as MainApplication).repository as com.example.kenza.database.repository.CleanedEmailRepository
             val cutoffTimestamp = System.currentTimeMillis() - TimeUnit.DAYS.toMillis(30)
-            
+
             // Find emails older than 30 days
-            val oldEmails = repository.getAllCleanedEmailsSync().filter { 
-                it.actionTimestamp < cutoffTimestamp 
+            val oldEmails = repository.getAllCleanedEmailsSync().filter {
+                it.actionTimestamp < cutoffTimestamp
             }
-            
+
             if (oldEmails.isNotEmpty()) {
                 // Delete old emails from database
                 repository.deleteMultiple(oldEmails)
-                
+
                 // Show notification
                 withContext(Dispatchers.Main) {
                     showCleanupNotification(oldEmails.size)
@@ -204,7 +217,7 @@ class DashboardActivity : AppCompatActivity() {
             }
         }
     }
-    
+
     private fun showCleanupNotification(count: Int) {
         val notification = NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_dialog_info)
@@ -229,20 +242,20 @@ class DashboardActivity : AppCompatActivity() {
             Toast.makeText(this, "Already processing emails, please wait...", Toast.LENGTH_SHORT).show()
             return
         }
-        
+
         // Reset counters
         totalEmailsProcessed = 0
         totalEmailsFound = 0
         totalEmailsCleaned = 0
         isProcessingEmails = true
         aiCleanedFolderIdCache = null // Reset cache before starting
-        
+
         updateProcessingStatus("Authenticating...")
         buttonClean.isEnabled = false
-        
+
         val app = (applicationContext as MainApplication)
         val msalInstance = app.msalInstance
-        
+
         msalInstance?.getCurrentAccountAsync(object : ISingleAccountPublicClientApplication.CurrentAccountCallback {
             override fun onAccountLoaded(activeAccount: IAccount?) {
                 if (activeAccount == null) {
@@ -288,13 +301,13 @@ class DashboardActivity : AppCompatActivity() {
         val app = applicationContext as MainApplication
         val preferencesManager = app.preferencesManager
         val maxEmails = preferencesManager.getMaxEmailsToProcess()
-        
+
         val isFirstRun = preferencesManager.isFirstRun()
         val lastCleanTime = preferencesManager.getLastCleanTime()
-        
+
         currentExclusionSenders = preferencesManager.getExclusionSenders() // Load rules
         Log.d(TAG, "Loaded exclusion rules: $currentExclusionSenders")
-        
+
         fetchAndProcessEmails(isFirstRun, lastCleanTime, maxEmails)
     }
 
@@ -307,12 +320,45 @@ class DashboardActivity : AppCompatActivity() {
             val dateString = dateFormat.format(Date(lastCleanTime))
             "&\$filter=receivedDateTime ge $dateString"
         }
-        
+
         updateProcessingStatus("Fetching emails...")
-        
+
         totalEmailsProcessed = 0
         totalEmailsFound = 0
         totalEmailsCleaned = 0
+
+        // Initialize email processing queue with 50-email chunks
+        emailProcessingQueue = com.example.kenza.utils.EmailProcessingQueue(
+            scope = activityScope,
+            processFunction = { task ->
+                // This function will process a single email and return whether it was cleaned
+                val wasCleaned = classifyAndProcessEmail(
+                    subject = task.subject,
+                    preview = task.preview,
+                    messageId = task.id,
+                    accessToken = task.accessToken,
+                    sender = task.sender,
+                    receivedDateTime = task.receivedDateTime
+                )
+
+                // Update our totals when an email is successfully cleaned
+                if (wasCleaned) {
+                    totalEmailsCleaned++
+                }
+
+                wasCleaned
+            },
+            chunkSize = 50, // Process in chunks of 50
+            processingDelayMs = 1000, // Add a delay between chunks to avoid throttling
+            onStatsUpdate = { stats ->
+                // Update UI when processing stats change
+                totalEmailsProcessed = stats.processed
+
+                runOnUiThread {
+                    updateProcessingStatus("Found: $totalEmailsFound\nProcessed: ${stats.processed}\nCleaned: $totalEmailsCleaned\nQueued: ${stats.queued}")
+                }
+            }
+        )
 
         GraphApiUtils.fetchGraphEmailPages(
             accessToken = accessToken ?: "",
@@ -325,11 +371,14 @@ class DashboardActivity : AppCompatActivity() {
                 val messageCount = messages.length()
                 Log.d(TAG, "Received batch of $messageCount emails")
                 totalEmailsFound += messageCount
-                updateProcessingStatus("Processing batch ($totalEmailsFound found)...")
+                updateProcessingStatus("Queuing batch ($totalEmailsFound found)...")
 
                 activityScope.launch {
-                    val processingJobs = (0 until messageCount).map { i ->
-                        async(emailProcessingDispatcher) {
+                    val emailTasks = mutableListOf<com.example.kenza.utils.EmailProcessingQueue.EmailTask>()
+
+                    // Convert JSON messages to EmailTask objects
+                    for (i in 0 until messageCount) {
+                        try {
                             val msg = messages.getJSONObject(i)
                             val messageId = msg.optString("id")
                             val subject = msg.optString("subject", "(No subject)")
@@ -342,41 +391,54 @@ class DashboardActivity : AppCompatActivity() {
                             }
                             val receivedDateTime = msg.optString("receivedDateTime", "")
 
-                            Log.d(TAG, "Processing email: $subject from $sender (ID: $messageId)")
-
-                            val wasCleaned = classifyAndProcessEmail(
-                                subject,
-                                bodyPreview,
-                                messageId,
-                                accessToken ?: "",
-                                sender,
-                                receivedDateTime
+                            // Add to our batch of emails to process
+                            emailTasks.add(
+                                com.example.kenza.utils.EmailProcessingQueue.EmailTask(
+                                    id = messageId,
+                                    subject = subject,
+                                    preview = bodyPreview,
+                                    sender = sender,
+                                    receivedDateTime = receivedDateTime,
+                                    accessToken = accessToken ?: ""
+                                )
                             )
-
-                            Pair(messageId, wasCleaned)
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Error parsing email message: ${e.message}")
                         }
                     }
 
-                    val results = processingJobs.awaitAll()
-
-                    val cleanedInBatch = results.count { it.second }
-                    val processedInBatch = results.size
-
-                    totalEmailsProcessed += processedInBatch
-                    totalEmailsCleaned += cleanedInBatch
-
-                    Log.d(TAG, "Batch complete. Processed: $processedInBatch, Cleaned: $cleanedInBatch. " +
-                             "Totals - Processed: $totalEmailsProcessed, Cleaned: $totalEmailsCleaned")
-
-                    updateProcessingStatus("Processed: $totalEmailsProcessed\nCleaned: $totalEmailsCleaned")
+                    // Add all emails to the processing queue
+                    emailProcessingQueue?.enqueueEmails(emailTasks)
                 }
             },
             onProgress = { processed, total ->
                 Log.d(TAG, "Pagination progress: $processed/$total")
             },
             onComplete = {
-                Log.d(TAG, "Email pagination complete. Total fetched matches processed: $totalEmailsProcessed")
-                completeProcessing()
+                Log.d(TAG, "Email pagination complete. Total fetched: $totalEmailsFound")
+
+                // Wait for all emails to be processed before completing
+                activityScope.launch {
+                    var remainingEmails = 1 // Just to enter the loop
+
+                    // Poll until queue is empty
+                    while (remainingEmails > 0) {
+                        val stats = emailProcessingQueue?.getStats()
+                        remainingEmails = stats?.queued ?: 0
+
+                        // If there are emails still being processed, wait a bit
+                        if (remainingEmails > 0) {
+                            delay(1000)
+                        }
+                    }
+
+                    // Clean up the queue
+                    emailProcessingQueue?.stop()
+                    emailProcessingQueue = null
+
+                    // Complete the processing
+                    completeProcessing()
+                }
             },
             onError = { error ->
                 Log.e(TAG, "Error in email pagination: $error")
@@ -406,9 +468,14 @@ class DashboardActivity : AppCompatActivity() {
         }
         // --- End Check ---
 
-        val useOpenAI = !(!BuildConfig.DEBUG || System.currentTimeMillis() % 3 == 0L)
+        // Simplified logic to use OpenAI
         val apiKey = BuildConfig.OPENAI_API_KEY ?: ""
-        val canUseOpenAI = useOpenAI && apiKey.isNotEmpty() && apiKey != "YOUR_API_KEY_HERE"
+        
+        // Log the API key length for debugging (never log the actual key)
+        Log.d(TAG, "OpenAI API key is ${if (apiKey.length > 5) "valid" else "missing or invalid"} (length: ${apiKey.length})")
+        
+        // Use OpenAI if we have a valid API key
+        val canUseOpenAI = apiKey.length > 20
 
         return if (canUseOpenAI) {
             try {
@@ -418,8 +485,8 @@ class DashboardActivity : AppCompatActivity() {
                 classifyEmailWithFallback(subject, preview, messageId, accessToken, sender, receivedDateTime)
             }
         } else {
-            if (!canUseOpenAI && useOpenAI) {
-                 Log.w(TAG, "OpenAI API key is missing or invalid, using fallback classification for $messageId")
+            if (!canUseOpenAI) {
+                Log.w(TAG, "OpenAI API key is missing or invalid, using fallback classification for $messageId")
             }
             classifyEmailWithFallback(subject, preview, messageId, accessToken, sender, receivedDateTime)
         }
@@ -444,33 +511,31 @@ class DashboardActivity : AppCompatActivity() {
             put(JSONObject().apply {
                 put("role", "user")
                 put("content", """
-                    Analyze this email to determine if it's unwanted content. Categorize it as one of the following:
-                    1. SPAM - unsolicited commercial messages, scams, or harmful content
-                    2. PROMOTION - marketing emails, deals, advertising
-                    3. NEWSLETTER - subscription-based bulk emails
-                    4. IMPORTANT - personal or business emails that require attention
-                    5. OTHER - any other legitimate email
+                    Analyze the following email content (Subject, Sender, Body Preview) to determine its category. Respond with ONLY ONE of the following words:
+
+                    1.  **SPAM**: Unsolicited junk, scams, phishing attempts, or clearly unwanted bulk mail.
+                    2.  **PROMOTION**: Marketing emails, advertisements, sales offers, deals.
+                    3.  **NEWSLETTER**: Regular updates, digests, or bulletins the user likely subscribed to.
+                    4.  **UNSUBSCRIBE**: Emails primarily offering a way to unsubscribe from mailing lists or newsletters, even if also promotional or newsletter-like. Look for explicit "unsubscribe" links or phrases.
+                    5.  **IMPORTANT**: Personal messages, direct business communication, replies, notifications requiring user action (e.g., password resets, alerts).
+                    6.  **OTHER**: Legitimate emails that don't fit the above categories (e.g., confirmations, transactional emails, general updates).
 
                     Subject: $subject
-                    
-                    From: $sender
-                    
-                    Body: $preview
-                    
-                    Respond with ONLY ONE of these words: SPAM, PROMOTION, NEWSLETTER, IMPORTANT, OTHER
+                    Sender: $sender
+                    Body Preview: $preview
                 """.trimIndent())
             })
         }
-        
+
         val json = JSONObject().apply {
             put("model", "gpt-4o-mini-2024-07-18")
             put("messages", messagesArray)
-            put("temperature", 0.3) 
-            put("max_tokens", 10) 
+            put("temperature", 0.2)
+            put("max_tokens", 15)
         }
-        
+
         Log.d(TAG, "OpenAI request for $messageId: $json")
-        
+
         val mediaType = "application/json".toMediaType()
         val body = json.toString().toRequestBody(mediaType)
         val request = Request.Builder()
@@ -480,62 +545,134 @@ class DashboardActivity : AppCompatActivity() {
             .post(body)
             .build()
 
-        val call = client.newCall(request)
-
-        continuation.invokeOnCancellation {
-            call.cancel()
+        // Add network connectivity check
+        val connectivityManager = applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val networkInfo = connectivityManager.activeNetworkInfo
+        
+        if (networkInfo == null || !networkInfo.isConnected) {
+            Log.e(TAG, "No network connection available for OpenAI API call")
+            activityScope.launch {
+                if (continuation.isActive) continuation.resume(classifyEmailWithFallback(subject, preview, messageId, accessToken, sender, receivedDateTime))
+            }
+            return@suspendCancellableCoroutine
         }
 
-        call.enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) {
-                if (continuation.isActive) {
-                    continuation.resumeWithException(e)
-                }
+        // Execute with retry logic
+        var retryCount = 0
+        val maxRetries = 2
+        
+        fun executeWithRetry() {
+            val call = client.newCall(request)
+            
+            continuation.invokeOnCancellation {
+                call.cancel()
             }
-
-            override fun onResponse(call: Call, response: Response) {
-                if (!continuation.isActive) return
-                try {
-                    val responseBody = response.body?.string() ?: "{}"
-                    if (!response.isSuccessful) {
-                        throw IOException("OpenAI API error ${response.code}: $responseBody")
-                    }
-
-                    Log.d(TAG, "OpenAI response for $messageId: $responseBody")
-                    val respJson = JSONObject(responseBody)
-                    val classification = respJson
-                        .optJSONArray("choices")
-                        ?.optJSONObject(0)
-                        ?.optJSONObject("message")
-                        ?.optString("content")
-                        ?.trim()
-                        ?.uppercase() ?: "OTHER"
-
-                    Log.d(TAG, "Email $messageId classified via OpenAI as: $classification")
-
-                    if (classification in listOf("SPAM", "PROMOTION", "NEWSLETTER")) {
-                        activityScope.launch(emailProcessingDispatcher) {
-                           try {
-                                val moved = moveEmailToFolderAction(
-                                    accessToken, messageId, "AI Cleaned", classification.lowercase(),
-                                    subject, sender, receivedDateTime
-                                )
-                                if (continuation.isActive) continuation.resume(moved)
-                           } catch (moveError: Exception) {
-                               Log.e(TAG, "Error moving email $messageId after OpenAI classification: ${moveError.message}", moveError)
-                               if (continuation.isActive) continuation.resume(false)
-                           }
+            
+            call.enqueue(object : Callback {
+                override fun onFailure(call: Call, e: IOException) {
+                    if (!continuation.isActive) return
+                    
+                    if (retryCount < maxRetries) {
+                        retryCount++
+                        Log.w(TAG, "Network failure for OpenAI API, retrying (${retryCount}/${maxRetries}): ${e.message}")
+                        // Delay before retry
+                        activityScope.launch {
+                            delay(1000L * retryCount)
+                            executeWithRetry()
                         }
                     } else {
-                         if (continuation.isActive) continuation.resume(false)
+                        Log.e(TAG, "OpenAI API call failed after $maxRetries retries: ${e.message}")
+                        activityScope.launch {
+                            if (continuation.isActive) continuation.resume(classifyEmailWithFallback(subject, preview, messageId, accessToken, sender, receivedDateTime))
+                        }
                     }
-                } catch (e: Exception) {
-                     if (continuation.isActive) continuation.resumeWithException(e)
-                } finally {
-                    response.close()
                 }
-            }
-        })
+
+                override fun onResponse(call: Call, response: Response) {
+                    if (!continuation.isActive) return
+                    try {
+                        val responseBody = response.body?.string() ?: "{}"
+                        if (!response.isSuccessful) {
+                            // For server errors (5xx), retry
+                            if (response.code in 500..599 && retryCount < maxRetries) {
+                                retryCount++
+                                Log.w(TAG, "OpenAI API server error ${response.code}, retrying (${retryCount}/${maxRetries}): $responseBody")
+                                response.close()
+                                activityScope.launch {
+                                    delay(1000L * retryCount)
+                                    executeWithRetry()
+                                }
+                                return
+                            }
+                            
+                            throw IOException("OpenAI API error ${response.code}: $responseBody")
+                        }
+
+                        Log.d(TAG, "OpenAI response for $messageId: $responseBody")
+                        val respJson = JSONObject(responseBody)
+                        val classification = respJson
+                            .optJSONArray("choices")
+                            ?.optJSONObject(0)
+                            ?.optJSONObject("message")
+                            ?.optString("content")
+                            ?.trim()
+                            ?.uppercase()
+                            ?.replace(".", "")
+                            ?.split(" ")?.firstOrNull()
+                            ?: "OTHER"
+
+                        Log.d(TAG, "Email $messageId classified via OpenAI as: $classification")
+
+                        val actionFolder: String?
+                        val actionTaken: String?
+
+                        when (classification) {
+                            "SPAM", "PROMOTION", "NEWSLETTER" -> {
+                                actionFolder = "AI Cleaned"
+                                actionTaken = "moved"
+                            }
+                            "UNSUBSCRIBE" -> {
+                                actionFolder = "AI Unsubscribed"
+                                actionTaken = "unsubscribed"
+                            }
+                            else -> {
+                                actionFolder = null
+                                actionTaken = null
+                            }
+                        }
+
+                        if (actionFolder != null && actionTaken != null) {
+                            activityScope.launch(emailProcessingDispatcher) {
+                                try {
+                                    val moved = moveEmailToFolderAction(
+                                        accessToken,
+                                        messageId, actionFolder, actionTaken,
+                                        subject, sender, receivedDateTime
+                                    )
+                                    if (continuation.isActive) continuation.resume(moved)
+                                } catch (moveError: Exception) {
+                                    Log.e(TAG, "Error performing action '$actionTaken' on email $messageId after OpenAI classification: ${moveError.message}", moveError)
+                                    if (continuation.isActive) continuation.resume(false)
+                                }
+                            }
+                        } else {
+                            if (continuation.isActive) continuation.resume(false)
+                        }
+
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error processing OpenAI response: ${e.message}", e)
+                        activityScope.launch {
+                            if (continuation.isActive) continuation.resume(classifyEmailWithFallback(subject, preview, messageId, accessToken, sender, receivedDateTime))
+                        }
+                    } finally {
+                        response.close()
+                    }
+                }
+            })
+        }
+        
+        // Start the execution with retry logic
+        executeWithRetry()
     }
 
     private suspend fun classifyEmailWithFallback(
@@ -546,25 +683,29 @@ class DashboardActivity : AppCompatActivity() {
         sender: String,
         receivedDateTime: String
     ): Boolean {
-        Log.d(TAG, "Using fallback classification for: $subject (ID: $messageId)")
-
         val subjectLower = subject.lowercase()
         val bodyLower = preview.lowercase()
         val senderLower = sender.lowercase()
-        
+
         val classification = when {
-            listOf("viagra", "lottery", "winner", "forex", "casino", "bitcoin", "investment opportunity", "crypto", "urgent", "prince").any { 
-                subjectLower.contains(it) || bodyLower.contains(it) 
+            listOf("viagra", "lottery", "winner", "claim prize", "urgent action required", "account suspended", "verify your account", "inheritance", "nigerian prince", "crypto opportunity", "forex trading", "casino bonus").any {
+                subjectLower.contains(it) || bodyLower.contains(it)
             } -> "spam"
-            listOf("newsletter", "weekly update", "digest", "bulletin", "subscribe", "unsubscribe").any { 
-                subjectLower.contains(it) || bodyLower.contains(it) 
-            } -> "newsletter"
-            listOf("sale", "discount", "offer", "deal", "promotion", "% off", "limited time", "buy now", "shop").any { 
-                subjectLower.contains(it) || bodyLower.contains(it) 
+
+            (subjectLower.contains("unsubscribe") || bodyLower.contains("unsubscribe") || bodyLower.contains("manage preferences") || bodyLower.contains("mailing list")) &&
+            (senderLower.contains("noreply") || senderLower.contains("no-reply") || senderLower.contains("newsletter") || senderLower.contains("marketing") || senderLower.contains("support") || senderLower.contains("info@") || senderLower.contains("news@") || senderLower.contains("updates@"))
+            -> "unsubscribe"
+
+            listOf("sale", "discount", "offer", "% off", "limited time", "shop now", "view deals", "coupon", "promotion", "advertisement", "flyer", "catalog").any {
+                subjectLower.contains(it) || bodyLower.contains(it)
             } -> "promotion"
-            senderLower.contains("marketing") || senderLower.contains("newsletter") || 
-            senderLower.contains("noreply") || senderLower.contains("no-reply") -> "newsletter"
-            bodyLower.contains("unsubscribe here") || subjectLower.contains("unsubscribe") -> "unsubscribe"
+
+            listOf("newsletter", "weekly update", "digest", "bulletin", "subscription", "updates from").any {
+                subjectLower.contains(it) || bodyLower.contains(it)
+            } || senderLower.contains("newsletter") || senderLower.contains("updates@") -> "newsletter"
+
+            senderLower.contains("noreply") || senderLower.contains("no-reply") || senderLower.contains("marketing@") || senderLower.contains("info@") || senderLower.contains("support@") || senderLower.contains("news@") -> "newsletter"
+
             else -> "important"
         }
 
@@ -577,29 +718,25 @@ class DashboardActivity : AppCompatActivity() {
             "unsubscribe" -> {
                 moveEmailToFolderAction(accessToken, messageId, "AI Unsubscribed", "unsubscribed", subject, sender, receivedDateTime)
             }
-            else -> false // Not cleaned
+            else -> false
         }
     }
 
-    private suspend fun moveEmailToFolderAction( // Renamed for clarity
+    private suspend fun moveEmailToFolderAction(
         accessToken: String,
         messageId: String,
-        targetFolderName: String, // e.g., "AI Cleaned", "AI Unsubscribed"
-        actionTaken: String, // e.g., "moved", "unsubscribed"
+        targetFolderName: String,
+        actionTaken: String,
         subject: String,
         sender: String,
         receivedDateTime: String
     ): Boolean {
         try {
-            // Use a cache specific to the folder name if needed, or simplify if only one target
-            // For now, let's assume findOrCreate handles concurrency adequately with the previous fix
-            // val folderId = getCachedFolderId(targetFolderName) ?: findOrCreateFolder(accessToken, targetFolderName).also { cacheFolderId(targetFolderName, it) }
+            // Pass both accessToken and targetFolderName to findOrCreateFolder
+            val folderId = graphApiService.findOrCreateFolder(accessToken, targetFolderName)
 
-            // Simplified: Find/Create folder every time (less efficient but handles multiple targets)
-            // Consider caching if performance becomes an issue with many target folders
-            val folderId = findOrCreateFolder(accessToken, targetFolderName)
-
-            val (success, error) = GraphApiUtils.moveEmail(accessToken, messageId, folderId)
+            // Pass accessToken to moveEmail as well
+            val (success, error) = graphApiService.moveEmail(accessToken, messageId, folderId)
 
             if (success) {
                 Log.d(TAG, "Successfully performed '$actionTaken' on $messageId -> folder '$targetFolderName'.")
@@ -608,7 +745,7 @@ class DashboardActivity : AppCompatActivity() {
                     subject = subject,
                     sender = sender,
                     receivedDate = System.currentTimeMillis(),
-                    actionTaken = actionTaken, // Use the provided action
+                    actionTaken = actionTaken,
                     actionTimestamp = System.currentTimeMillis(),
                     originalFolder = "inbox"
                 )
@@ -617,85 +754,12 @@ class DashboardActivity : AppCompatActivity() {
                 }
                 return true
             } else {
-                Log.e(TAG, "Failed to perform '$actionTaken' on $messageId -> folder '$targetFolderName': $error")
+                Log.e(TAG, "Failed to perform '$actionTaken' on $messageId to folder '$targetFolderName': $error")
                 return false
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Error during '$actionTaken' action for $messageId -> folder '$targetFolderName': ${e.message}", e)
+            Log.e(TAG, "Exception during moveEmailToFolderAction for $messageId: ${e.message}", e)
             return false
-        }
-    }
-
-    private suspend fun findOrCreateFolder(accessToken: String, folderName: String): String = withContext(Dispatchers.IO) {
-        val client = OkHttpClient()
-
-        suspend fun findFolder(): String? {
-            val findRequest = Request.Builder()
-                .url("https://graph.microsoft.com/v1.0/me/mailFolders?\$filter=displayName eq '$folderName'")
-                .addHeader("Authorization", "Bearer $accessToken")
-                .build()
-            try {
-                client.newCall(findRequest).execute().use { response ->
-                    if (response.isSuccessful) {
-                        val responseBody = response.body?.string()
-                        val folders = JSONObject(responseBody ?: "").optJSONArray("value")
-                        if (folders != null && folders.length() > 0) {
-                            val existingId = folders.getJSONObject(0).optString("id")
-                            if (existingId.isNotEmpty()) {
-                                Log.d(TAG, "Found existing folder '$folderName' with ID: $existingId")
-                                return existingId
-                            }
-                        }
-                    } else {
-                        Log.w(TAG, "Failed to query for folder '$folderName': ${response.code}")
-                    }
-                }
-            } catch (e: IOException) {
-                Log.e(TAG, "Network error finding folder '$folderName': ${e.message}", e)
-            }
-            return null
-        }
-
-        var folderId = findFolder()
-        if (folderId != null) {
-            return@withContext folderId
-        }
-
-        Log.d(TAG, "Folder '$folderName' not found, attempting to create.")
-        val mediaType = "application/json".toMediaType()
-        val createJson = JSONObject().apply { put("displayName", folderName) }
-        val createBody = createJson.toString().toRequestBody(mediaType)
-        val createRequest = Request.Builder()
-            .url("https://graph.microsoft.com/v1.0/me/mailFolders")
-            .addHeader("Authorization", "Bearer $accessToken")
-            .addHeader("Content-Type", "application/json")
-            .post(createBody)
-            .build()
-
-        try {
-            client.newCall(createRequest).execute().use { response ->
-                if (response.isSuccessful) {
-                    val responseBody = response.body?.string()
-                    val newId = JSONObject(responseBody ?: "").optString("id")
-                    if (newId.isNotEmpty()) {
-                        Log.d(TAG, "Successfully created folder '$folderName' with ID: $newId")
-                        return@withContext newId
-                    } else {
-                        throw IOException("Folder creation for '$folderName' returned empty ID.")
-                    }
-                } else {
-                     val errorBody = response.body?.string()
-                     if (response.code == 409 && errorBody?.contains("NameAlreadyExists", ignoreCase = true) == true) {
-                         Log.w(TAG,"Folder '$folderName' likely created concurrently. Retrying find.")
-                         delay(500)
-                         return@withContext findOrCreateFolder(accessToken, folderName)
-                     }
-                     throw IOException("Create folder '$folderName' failed: ${response.code} - $errorBody")
-                }
-            }
-        } catch (e: IOException) {
-             Log.e(TAG, "Error creating folder '$folderName': ${e.message}", e)
-             throw e
         }
     }
 
@@ -725,7 +789,7 @@ class DashboardActivity : AppCompatActivity() {
             }, 5000)
         }
     }
-    
+
     private fun updateProcessingStatus(status: String?) {
         runOnUiThread {
             if (status == null) {
@@ -789,7 +853,7 @@ class DashboardActivity : AppCompatActivity() {
             "Full Clean (All Emails)",
             "Set Email Limit"
         )
-        
+
         AlertDialog.Builder(this)
             .setTitle("Cleaning Options")
             .setItems(options) { _, which ->
@@ -810,11 +874,11 @@ class DashboardActivity : AppCompatActivity() {
             .setNegativeButton("Cancel", null)
             .show()
     }
-    
+
     private fun showSetEmailLimitDialog() {
         val app = applicationContext as MainApplication
         val currentLimit = app.preferencesManager.getMaxEmailsToProcess()
-        
+
         val options = arrayOf("25", "50", "100", "200", "500", "1000")
         val selectedIndex = when (currentLimit) {
             25 -> 0
@@ -825,7 +889,7 @@ class DashboardActivity : AppCompatActivity() {
             1000 -> 5
             else -> 2
         }
-        
+
         AlertDialog.Builder(this)
             .setTitle("Maximum Emails to Process")
             .setSingleChoiceItems(options, selectedIndex) { dialog, which ->

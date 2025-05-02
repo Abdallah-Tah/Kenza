@@ -38,11 +38,20 @@ class MainApplication : Application() {
         // Initialize MSAL
         initializeMsal()
         
-        // Configure WorkManager for background tasks
-        val workManagerConfig = Configuration.Builder()
-            .setMinimumLoggingLevel(Log.INFO)
-            .build()
-        WorkManager.initialize(this, workManagerConfig)
+        // Initialize WorkManager with a custom configuration
+        // We've disabled the default initializer in the manifest
+        try {
+            val workManagerConfig = Configuration.Builder()
+                .setMinimumLoggingLevel(Log.INFO)
+                .build()
+                
+            // Initialize WorkManager with our custom configuration
+            WorkManager.initialize(this, workManagerConfig)
+            Log.d(TAG, "WorkManager initialized successfully")
+        } catch (e: Exception) {
+            // In case WorkManager is already initialized (shouldn't happen with manifest changes)
+            Log.e(TAG, "Error initializing WorkManager: ${e.message}")
+        }
         
         // Check for scheduled cleaning
         checkAndRestoreScheduledCleaning()
