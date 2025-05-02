@@ -16,20 +16,26 @@ import java.io.IOException
 import java.net.URLDecoder
 import java.util.concurrent.TimeUnit
 import kotlin.math.pow
+import android.net.ConnectivityManager
+import android.content.Context
+import kotlin.random.Random
 
 class GraphApiUtils {
     companion object {
         private const val TAG = "GraphApiUtils"
-        private const val MAX_RETRIES = 6 // Increased max retries for rate limiting
+        private const val MAX_RETRIES = 6 // Maximum retry attempts
         private const val INITIAL_DELAY_MS = 1000L // Initial delay in milliseconds
-        private const val CONCURRENCY_LIMIT = 3 // Reduced concurrent requests to avoid throttling
+        private const val CONCURRENCY_LIMIT = 3 // Limit concurrent requests
         private val activeRequests = java.util.concurrent.atomic.AtomicInteger(0)
         
-        // Add a static field to track throttling status
-        private var isThrottled = false
-        private var throttleEndTime = 0L
+        // Global throttling and network status tracking
+        @Volatile private var isThrottled = false
+        @Volatile private var throttleEndTime = 0L
+        @Volatile private var globalBackoffEndTime = 0L
+        private val networkErrorCount = java.util.concurrent.atomic.AtomicInteger(0)
+        @Volatile private var lastNetworkErrorTime = 0L
         
-        // Public methods to check throttling status - needed for DashboardActivity
+        // Public methods to check throttling status
         fun isThrottled(): Boolean = isThrottled && throttleEndTime > System.currentTimeMillis()
         
         fun getRemainingThrottleTime(): Long {
@@ -40,28 +46,29 @@ class GraphApiUtils {
             }
         }
         
-        // Make this public for use in DashboardActivity
+        // Check if we're in global backoff mode
+        fun isInGlobalBackoff(): Boolean = globalBackoffEndTime > System.currentTimeMillis()
+        
+        fun getRemainingGlobalBackoffTime(): Long {
+            return if (isInGlobalBackoff()) {
+                globalBackoffEndTime - System.currentTimeMillis()
+            } else {
+                0L
+            }
+        }
+        
+        // Create HTTP client with improved timeouts
         fun createHttpClient(): OkHttpClient {
             return OkHttpClient.Builder()
-                .connectTimeout(45, TimeUnit.SECONDS) // Increased timeout
-                .readTimeout(45, TimeUnit.SECONDS)  // Increased timeout
-                .writeTimeout(45, TimeUnit.SECONDS) // Increased timeout
-                .retryOnConnectionFailure(true)     // Enable retry on connection failure
+                .connectTimeout(60, TimeUnit.SECONDS)
+                .readTimeout(60, TimeUnit.SECONDS)
+                .writeTimeout(60, TimeUnit.SECONDS)
+                .retryOnConnectionFailure(false) // We'll handle retries ourselves
                 .build()
         }
         
         /**
-         * Fetches email pages from Microsoft Graph with pagination support.
-         * @param accessToken Bearer token for Graph API
-         * @param baseUrl Graph API URL for messages endpoint
-         * @param filterQuery Optional filter query string (starting with &)
-         * @param batchSize Number of items per page (max 50)
-         * @param maxEmails Maximum total emails to fetch before stopping
-         * @param initialSkipToken Initial skip token for pagination (can be either skiptoken or skip value)
-         * @param onBatch Callback invoked with each batch of messages
-         * @param onProgress Callback invoked with (fetchedCount, maxEmails)
-         * @param onComplete Callback invoked when fetching completes
-         * @param onError Callback invoked on error with message
+         * Fetches email pages from Microsoft Graph with pagination support and improved network error handling.
          */
         fun fetchGraphEmailPages(
             accessToken: String,
@@ -87,13 +94,22 @@ class GraphApiUtils {
                     return
                 }
                 
-                // Check concurrency limit and wait if needed
-                while (activeRequests.get() >= CONCURRENCY_LIMIT) {
-                    delay(500)
+                // Check if we're in global backoff mode due to network issues
+                val remainingGlobalBackoff = globalBackoffEndTime - System.currentTimeMillis()
+                if (remainingGlobalBackoff > 0) {
+                    Log.w(TAG, "In global backoff mode. Waiting ${remainingGlobalBackoff}ms before attempting request")
+                    delay(remainingGlobalBackoff + Random.nextLong(100, 500))
                 }
                 
-                // Check global throttling first
+                // Check throttling and wait if needed
                 waitForThrottlingToEnd()
+                
+                // Check concurrency limit and wait if needed - add jitter to prevent thundering herd
+                while (activeRequests.get() >= CONCURRENCY_LIMIT) {
+                    val waitTime = 300 + Random.nextLong(0, 500)
+                    Log.d(TAG, "Concurrency limit reached (${activeRequests.get()}/$CONCURRENCY_LIMIT). Waiting ${waitTime}ms")
+                    delay(waitTime)
+                }
                 
                 val urlBuilder = StringBuilder("$baseUrl?").apply {
                     append("\$top=").append(batchSize)
@@ -122,6 +138,9 @@ class GraphApiUtils {
                     
                     response.use { 
                         activeRequests.decrementAndGet()
+                        
+                        // Reset network error count on successful response
+                        networkErrorCount.set(0)
                         
                         if (it.code == 429) {
                             // Throttling detected, implement exponential backoff
@@ -222,7 +241,7 @@ class GraphApiUtils {
 
                                     if (paginationValue != null) {
                                         // Add a small delay between pagination requests to avoid rate limiting
-                                        delay(300)
+                                        delay(500 + Random.nextLong(0, 500)) // Add jitter
                                         fetchPageWithRetry()
                                     } else {
                                         Log.e(TAG, "Failed to extract \$skiptoken OR \$skip from nextLink: $nextLink")
@@ -239,6 +258,26 @@ class GraphApiUtils {
                     }
                 } catch (e: IOException) {
                     activeRequests.decrementAndGet()
+                    
+                    // Update network error tracking
+                    val currentTime = System.currentTimeMillis()
+                    val timeSinceLastError = currentTime - lastNetworkErrorTime
+                    lastNetworkErrorTime = currentTime
+                    
+                    // If errors are happening in quick succession, increment counter
+                    if (timeSinceLastError < 5000) {
+                        networkErrorCount.incrementAndGet()
+                    } else {
+                        // Reset if it's been a while since the last error
+                        networkErrorCount.set(1)
+                    }
+                    
+                    // Implement circuit breaker pattern with global backoff if multiple errors
+                    if (networkErrorCount.get() >= 5) {
+                        val backoffTime = 5000L * Math.pow(2.0, Math.min(5, networkErrorCount.get() / 5).toDouble()).toLong()
+                        setGlobalBackoff(backoffTime)
+                        Log.w(TAG, "Multiple network errors detected. Setting global backoff for ${backoffTime}ms")
+                    }
                     
                     if (retryCount < MAX_RETRIES) {
                         // Exponential backoff for network failures
@@ -269,7 +308,7 @@ class GraphApiUtils {
         }
 
         // Helper method to handle throttling responses
-        private suspend fun handleThrottling(response: Response, retryCount: Int): Long {
+        private fun handleThrottling(response: Response, retryCount: Int): Long {
             val retryAfterSeconds = response.header("Retry-After")?.toIntOrNull() ?: (retryCount + 1)
             val waitMs = (INITIAL_DELAY_MS * 2.0.pow(retryCount)).toLong() + (retryAfterSeconds * 1000L)
             
@@ -283,21 +322,37 @@ class GraphApiUtils {
             return waitMs
         }
 
+        // Set global backoff for all requests due to network issues
+        private fun setGlobalBackoff(durationMs: Long) {
+            globalBackoffEndTime = System.currentTimeMillis() + durationMs.coerceAtMost(120000) // Max 2 minutes
+            Log.w(TAG, "Setting global backoff until ${globalBackoffEndTime}")
+        }
+
         // Helper method to handle network errors with appropriate backoff
-        private suspend fun handleNetworkError(error: IOException, retryCount: Int): Long {
+        private fun handleNetworkError(error: IOException, retryCount: Int): Long {
             val message = error.message ?: ""
             val baseDelay = if (message.contains("Unable to resolve host") || 
                                message.contains("Failed to connect") ||
                                message.contains("Connection refused") ||
                                message.contains("timeout")) {
                 // For DNS or connection issues, use longer backoff
-                3000L * 2.0.pow(retryCount.toDouble())
+                (3000L * 2.0.pow((retryCount + 1).toDouble())).toLong()
             } else {
                 // For other network issues
-                INITIAL_DELAY_MS * 2.0.pow(retryCount.toDouble())
+                (INITIAL_DELAY_MS * 2.0.pow(retryCount.toDouble())).toLong()
             }
             
-            return baseDelay.toLong().coerceAtMost(60000L) // Cap at 1 minute
+            // Add jitter to prevent thundering herd
+            val jitter = Random.nextLong(0, 1000)
+            
+            return (baseDelay + jitter).coerceAtMost(120000L) // Cap at 2 minutes
+        }
+
+        // Helper to check network connectivity
+        fun isNetworkAvailable(context: Context): Boolean {
+            val connectivityManager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            val networkInfo = connectivityManager.activeNetworkInfo
+            return networkInfo != null && networkInfo.isConnected
         }
 
         suspend fun deleteEmail(
@@ -309,6 +364,16 @@ class GraphApiUtils {
             val requestUrl = "https://graph.microsoft.com/v1.0/me/messages/$messageId"
             Log.d(TAG, "Attempting to delete email: $messageId (Retry: $retryCount)")
 
+            // Check if we're in global backoff mode
+            val remainingGlobalBackoff = globalBackoffEndTime - System.currentTimeMillis()
+            if (remainingGlobalBackoff > 0) {
+                Log.w(TAG, "In global backoff mode. Waiting ${remainingGlobalBackoff}ms before attempting delete")
+                delay(remainingGlobalBackoff + Random.nextLong(100, 500))
+            }
+
+            // Check throttling and wait if needed
+            waitForThrottlingToEnd()
+
             val request = Request.Builder()
                 .url(requestUrl)
                 .delete()
@@ -316,11 +381,10 @@ class GraphApiUtils {
                 .build()
 
             try {
-                // Check global throttling first
-                waitForThrottlingToEnd()
-                
+                // Check concurrency limit and wait if needed
                 while (activeRequests.get() >= CONCURRENCY_LIMIT) {
-                    delay(300)
+                    val waitTime = 300 + Random.nextLong(0, 500)
+                    delay(waitTime)
                 }
                 
                 activeRequests.incrementAndGet()
@@ -331,6 +395,9 @@ class GraphApiUtils {
                 }
                 
                 activeRequests.decrementAndGet()
+                
+                // Reset network error count on successful response
+                networkErrorCount.set(0)
 
                 return response.use {
                     if (it.isSuccessful) {
@@ -364,6 +431,26 @@ class GraphApiUtils {
                 activeRequests.decrementAndGet()
                 Log.e(TAG, "Network error deleting email $messageId: ${e.message}", e)
                 
+                // Update network error tracking
+                val currentTime = System.currentTimeMillis()
+                val timeSinceLastError = currentTime - lastNetworkErrorTime
+                lastNetworkErrorTime = currentTime
+                
+                // If errors are happening in quick succession, increment counter
+                if (timeSinceLastError < 5000) {
+                    networkErrorCount.incrementAndGet()
+                } else {
+                    // Reset if it's been a while since the last error
+                    networkErrorCount.set(1)
+                }
+                
+                // Implement circuit breaker if multiple errors
+                if (networkErrorCount.get() >= 5) {
+                    val backoffTime = 5000L * Math.pow(2.0, Math.min(5, networkErrorCount.get() / 5).toDouble()).toLong()
+                    setGlobalBackoff(backoffTime)
+                    Log.w(TAG, "Multiple network errors detected. Setting global backoff for ${backoffTime}ms")
+                }
+                
                 // Improved retry handling for network errors
                 if (retryCount < MAX_RETRIES) {
                     val delayMs = handleNetworkError(e, retryCount)
@@ -382,7 +469,14 @@ class GraphApiUtils {
             destinationFolderId: String,
             retryCount: Int = 0
         ): Pair<Boolean, String?> {
-            // Check global throttling first
+            // Check if we're in global backoff mode
+            val remainingGlobalBackoff = globalBackoffEndTime - System.currentTimeMillis()
+            if (remainingGlobalBackoff > 0) {
+                Log.w(TAG, "In global backoff mode. Waiting ${remainingGlobalBackoff}ms before attempting move")
+                delay(remainingGlobalBackoff + Random.nextLong(100, 500))
+            }
+            
+            // Check throttling and wait if needed
             waitForThrottlingToEnd()
             
             val client = createHttpClient()
@@ -405,7 +499,7 @@ class GraphApiUtils {
             try {
                 // Check concurrency limit and wait if needed - add jitter to avoid thundering herd
                 while (activeRequests.get() >= CONCURRENCY_LIMIT) {
-                    val waitTime = 300L + (Math.random() * 400).toLong()
+                    val waitTime = 300L + Random.nextLong(0, 500)
                     delay(waitTime)
                 }
                 
@@ -417,6 +511,9 @@ class GraphApiUtils {
                 }
                 
                 activeRequests.decrementAndGet()
+                
+                // Reset network error count on successful response
+                networkErrorCount.set(0)
 
                 return response.use {
                     if (it.isSuccessful) {
@@ -457,6 +554,26 @@ class GraphApiUtils {
             } catch (e: IOException) {
                 activeRequests.decrementAndGet()
                 Log.e(TAG, "Network error moving email $messageId: ${e.message}", e)
+                
+                // Update network error tracking
+                val currentTime = System.currentTimeMillis()
+                val timeSinceLastError = currentTime - lastNetworkErrorTime
+                lastNetworkErrorTime = currentTime
+                
+                // If errors are happening in quick succession, increment counter
+                if (timeSinceLastError < 5000) {
+                    networkErrorCount.incrementAndGet()
+                } else {
+                    // Reset if it's been a while since the last error
+                    networkErrorCount.set(1)
+                }
+                
+                // Implement circuit breaker if multiple errors
+                if (networkErrorCount.get() >= 5) {
+                    val backoffTime = 5000L * Math.pow(2.0, Math.min(5, networkErrorCount.get() / 5).toDouble()).toLong()
+                    setGlobalBackoff(backoffTime)
+                    Log.w(TAG, "Multiple network errors detected during move. Setting global backoff for ${backoffTime}ms")
+                }
                 
                 // Improved retry handling for network errors
                 if (retryCount < MAX_RETRIES) {

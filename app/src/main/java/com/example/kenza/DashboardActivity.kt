@@ -312,13 +312,34 @@ class DashboardActivity : AppCompatActivity() {
     }
 
     private fun fetchAndProcessEmails(isFirstRun: Boolean, lastCleanTime: Long, maxEmails: Int) {
+        val app = applicationContext as MainApplication
+        val preferencesManager = app.preferencesManager
+        
+        // Set the processing flag to true and clear any previous batch ID
+        preferencesManager.setProcessingInProgress(true)
+        preferencesManager.saveProcessingBatchId(null)
+        
+        // Check if a previous run was interrupted
+        val wasInterrupted = preferencesManager.isProcessingInProgress() && !isFirstRun
+        if (wasInterrupted) {
+            Log.w(TAG, "Detected a previous interrupted email processing session. Continuing from last known point.")
+        }
+        
+        // Use the ISO date from the last processed email if available, otherwise use timestamp
+        val lastProcessedDate = preferencesManager.getLastProcessedEmailDate()
         val filterQuery = if (isFirstRun) {
             ""
+        } else if (lastProcessedDate != null) {
+            // Use the more precise ISO date string if available
+            Log.d(TAG, "Filtering emails newer than ISO date: $lastProcessedDate")
+            "&\$filter=receivedDateTime gt $lastProcessedDate"
         } else {
+            // Fall back to timestamp-based filtering
             val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US)
             dateFormat.timeZone = TimeZone.getTimeZone("UTC")
             val dateString = dateFormat.format(Date(lastCleanTime))
-            "&\$filter=receivedDateTime ge $dateString"
+            Log.d(TAG, "Filtering emails newer than timestamp: $dateString")
+            "&\$filter=receivedDateTime gt $dateString"
         }
 
         updateProcessingStatus("Fetching emails...")
@@ -344,6 +365,12 @@ class DashboardActivity : AppCompatActivity() {
                 // Update our totals when an email is successfully cleaned
                 if (wasCleaned) {
                     totalEmailsCleaned++
+                    
+                    // Store this email's received date as our latest processed email
+                    // This helps us pick up from exactly where we left off if interrupted
+                    if (task.receivedDateTime.isNotEmpty()) {
+                        preferencesManager.saveLastProcessedEmailDate(task.receivedDateTime)
+                    }
                 }
 
                 wasCleaned
@@ -499,7 +526,7 @@ class DashboardActivity : AppCompatActivity() {
         accessToken: String,
         sender: String,
         receivedDateTime: String
-    ): Boolean = suspendCancellableCoroutine { continuation ->
+    ): Boolean {
         val client = OkHttpClient.Builder()
             .connectTimeout(30, TimeUnit.SECONDS)
             .readTimeout(30, TimeUnit.SECONDS)
@@ -528,7 +555,7 @@ class DashboardActivity : AppCompatActivity() {
         }
 
         val json = JSONObject().apply {
-            put("model", "gpt-4o-mini-2024-07-18")
+            put("model", "gpt-3.5-turbo")
             put("messages", messagesArray)
             put("temperature", 0.2)
             put("max_tokens", 15)
@@ -551,128 +578,96 @@ class DashboardActivity : AppCompatActivity() {
         
         if (networkInfo == null || !networkInfo.isConnected) {
             Log.e(TAG, "No network connection available for OpenAI API call")
-            activityScope.launch {
-                if (continuation.isActive) continuation.resume(classifyEmailWithFallback(subject, preview, messageId, accessToken, sender, receivedDateTime))
-            }
-            return@suspendCancellableCoroutine
+            return classifyEmailWithFallback(subject, preview, messageId, accessToken, sender, receivedDateTime)
         }
 
         // Execute with retry logic
         var retryCount = 0
         val maxRetries = 2
         
-        fun executeWithRetry() {
-            val call = client.newCall(request)
-            
-            continuation.invokeOnCancellation {
-                call.cancel()
-            }
-            
-            call.enqueue(object : Callback {
-                override fun onFailure(call: Call, e: IOException) {
-                    if (!continuation.isActive) return
-                    
-                    if (retryCount < maxRetries) {
-                        retryCount++
-                        Log.w(TAG, "Network failure for OpenAI API, retrying (${retryCount}/${maxRetries}): ${e.message}")
-                        // Delay before retry
-                        activityScope.launch {
-                            delay(1000L * retryCount)
-                            executeWithRetry()
-                        }
-                    } else {
-                        Log.e(TAG, "OpenAI API call failed after $maxRetries retries: ${e.message}")
-                        activityScope.launch {
-                            if (continuation.isActive) continuation.resume(classifyEmailWithFallback(subject, preview, messageId, accessToken, sender, receivedDateTime))
-                        }
-                    }
-                }
-
-                override fun onResponse(call: Call, response: Response) {
-                    if (!continuation.isActive) return
-                    try {
-                        val responseBody = response.body?.string() ?: "{}"
-                        if (!response.isSuccessful) {
-                            // For server errors (5xx), retry
-                            if (response.code in 500..599 && retryCount < maxRetries) {
-                                retryCount++
-                                Log.w(TAG, "OpenAI API server error ${response.code}, retrying (${retryCount}/${maxRetries}): $responseBody")
-                                response.close()
-                                activityScope.launch {
+        try {
+            while (true) {
+                try {
+                    return withContext(Dispatchers.IO) {
+                        val response = client.newCall(request).execute()
+                        response.use { resp ->
+                            val responseBody = resp.body?.string() ?: "{}"
+                            if (!resp.isSuccessful) {
+                                // For server errors (5xx), retry
+                                if (resp.code in 500..599 && retryCount < maxRetries) {
+                                    retryCount++
+                                    Log.w(TAG, "OpenAI API server error ${resp.code}, retrying (${retryCount}/${maxRetries}): $responseBody")
                                     delay(1000L * retryCount)
-                                    executeWithRetry()
+                                    return@withContext false // Continue the outer while loop
                                 }
-                                return
+                                
+                                throw IOException("OpenAI API error ${resp.code}: $responseBody")
                             }
-                            
-                            throw IOException("OpenAI API error ${response.code}: $responseBody")
-                        }
 
-                        Log.d(TAG, "OpenAI response for $messageId: $responseBody")
-                        val respJson = JSONObject(responseBody)
-                        val classification = respJson
-                            .optJSONArray("choices")
-                            ?.optJSONObject(0)
-                            ?.optJSONObject("message")
-                            ?.optString("content")
-                            ?.trim()
-                            ?.uppercase()
-                            ?.replace(".", "")
-                            ?.split(" ")?.firstOrNull()
-                            ?: "OTHER"
+                            Log.d(TAG, "OpenAI response for $messageId: $responseBody")
+                            val respJson = JSONObject(responseBody)
+                            val classification = respJson
+                                .optJSONArray("choices")
+                                ?.optJSONObject(0)
+                                ?.optJSONObject("message")
+                                ?.optString("content")
+                                ?.trim()
+                                ?.uppercase()
+                                ?.replace(".", "")
+                                ?.split(" ")?.firstOrNull()
+                                ?: "OTHER"
 
-                        Log.d(TAG, "Email $messageId classified via OpenAI as: $classification")
+                            Log.d(TAG, "Email $messageId classified via OpenAI as: $classification")
 
-                        val actionFolder: String?
-                        val actionTaken: String?
+                            val actionFolder: String?
+                            val actionTaken: String?
 
-                        when (classification) {
-                            "SPAM", "PROMOTION", "NEWSLETTER" -> {
-                                actionFolder = "AI Cleaned"
-                                actionTaken = "moved"
+                            when (classification) {
+                                "SPAM", "PROMOTION", "NEWSLETTER" -> {
+                                    actionFolder = "AI Cleaned"
+                                    actionTaken = "moved"
+                                }
+                                "UNSUBSCRIBE" -> {
+                                    actionFolder = "AI Unsubscribed"
+                                    actionTaken = "unsubscribed"
+                                }
+                                else -> {
+                                    actionFolder = null
+                                    actionTaken = null
+                                }
                             }
-                            "UNSUBSCRIBE" -> {
-                                actionFolder = "AI Unsubscribed"
-                                actionTaken = "unsubscribed"
-                            }
-                            else -> {
-                                actionFolder = null
-                                actionTaken = null
-                            }
-                        }
 
-                        if (actionFolder != null && actionTaken != null) {
-                            activityScope.launch(emailProcessingDispatcher) {
-                                try {
-                                    val moved = moveEmailToFolderAction(
+                            if (actionFolder != null && actionTaken != null) {
+                                withContext(emailProcessingDispatcher) {
+                                    moveEmailToFolderAction(
                                         accessToken,
                                         messageId, actionFolder, actionTaken,
                                         subject, sender, receivedDateTime
                                     )
-                                    if (continuation.isActive) continuation.resume(moved)
-                                } catch (moveError: Exception) {
-                                    Log.e(TAG, "Error performing action '$actionTaken' on email $messageId after OpenAI classification: ${moveError.message}", moveError)
-                                    if (continuation.isActive) continuation.resume(false)
                                 }
+                            } else {
+                                false
                             }
-                        } else {
-                            if (continuation.isActive) continuation.resume(false)
                         }
-
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Error processing OpenAI response: ${e.message}", e)
-                        activityScope.launch {
-                            if (continuation.isActive) continuation.resume(classifyEmailWithFallback(subject, preview, messageId, accessToken, sender, receivedDateTime))
-                        }
-                    } finally {
-                        response.close()
+                    }
+                } catch (e: IOException) {
+                    if (retryCount < maxRetries) {
+                        retryCount++
+                        Log.w(TAG, "Network failure for OpenAI API, retrying (${retryCount}/${maxRetries}): ${e.message}")
+                        delay(1000L * retryCount)
+                    } else {
+                        Log.e(TAG, "OpenAI API call failed after $maxRetries retries: ${e.message}")
+                        return classifyEmailWithFallback(subject, preview, messageId, accessToken, sender, receivedDateTime)
                     }
                 }
-            })
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error in OpenAI classification: ${e.message}", e)
+            return classifyEmailWithFallback(subject, preview, messageId, accessToken, sender, receivedDateTime)
         }
         
-        // Start the execution with retry logic
-        executeWithRetry()
+        // This won't be reached due to the infinite loop with returns, but it keeps the compiler happy
+        return false
     }
 
     private suspend fun classifyEmailWithFallback(
@@ -764,9 +759,23 @@ class DashboardActivity : AppCompatActivity() {
     }
 
     private fun completeProcessing(didProcess: Boolean = true) {
+        val app = applicationContext as MainApplication
+        val preferencesManager = app.preferencesManager
+        
         if (didProcess) {
-            val app = applicationContext as MainApplication
-            app.preferencesManager.saveLastCleanTime()
+            // If we successfully processed emails, update the last clean time
+            preferencesManager.saveLastCleanTime()
+            
+            // Clear the processing flags to indicate we're done
+            preferencesManager.setProcessingInProgress(false)
+            preferencesManager.saveProcessingBatchId(null)
+            
+            Log.d(TAG, "Email processing completed successfully. ${totalEmailsProcessed} processed, ${totalEmailsCleaned} cleaned.")
+        } else {
+            // We still need to clear the processing flag even if we didn't complete normally
+            preferencesManager.setProcessingInProgress(false)
+            
+            Log.w(TAG, "Email processing stopped without completion.")
         }
 
         runOnUiThread {

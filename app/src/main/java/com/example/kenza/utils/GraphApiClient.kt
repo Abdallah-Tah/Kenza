@@ -258,9 +258,9 @@ class GraphApiClientImpl : GraphApiClient {
         
         // More aggressive backoff for DNS/connection issues
         val baseDelay = if (isConnectionIssue) {
-            3000L * Math.pow(2.0, (retryCount + 1).toDouble())
+            (3000L * Math.pow(2.0, (retryCount + 1).toDouble())).toLong()
         } else {
-            INITIAL_DELAY_MS * Math.pow(2.0, retryCount.toDouble())
+            (INITIAL_DELAY_MS * Math.pow(2.0, retryCount.toDouble())).toLong()
         }
         
         // Add jitter to prevent thundering herd
